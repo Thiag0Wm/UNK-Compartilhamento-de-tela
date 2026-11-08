@@ -103,7 +103,8 @@ function setRoomView() {
   roomTitle.textContent = "Entre na sala.";
   roomDescription.textContent = "Informe seu nome para entrar e aparecer na lista de participantes.";
   placeholderTitle.textContent = "Aguardando compartilhamento";
-  placeholderDescription.textContent = "Qualquer pessoa na sala pode iniciar o compartilhamento.";
+  placeholderDescription.textContent = "A mídia ao vivo é ponto a ponto entre o anfitrião e um visitante por vez.";
+  shareButton.disabled = true;
   roomNameInput.focus();
   roomEyebrow.innerHTML = '<span class="eyebrow-line"></span> SALA DE COMPARTILHAMENTO';
   inviteLink.value = `${window.location.origin}/?room=${encodeURIComponent(roomId)}&role=viewer`;
@@ -117,7 +118,7 @@ function setRoomView() {
 
 function renderParticipants(participants) {
   remoteParticipantName = participants.find((participant) => participant.role !== role)?.name || "";
-  participantsCount.textContent = String(participants.length);
+  participantsCount.textContent = `${participants.length}/5`;
   participantsList.replaceChildren();
   if (!participants.length) {
     const empty = document.createElement("li");
@@ -277,6 +278,7 @@ async function connectToRoom() {
     socket.on("sharing-state", ({ active, name }) => updateRemoteTransmissionState(active, name));
     socket.on("peer-ready", () => {
       peerIsReady = true;
+      shareButton.disabled = false;
       showStatus("Outra pessoa entrou; mídia aguardando a tela");
       placeholderTitle.textContent = "A outra pessoa entrou";
       placeholderDescription.textContent = screenStream
@@ -287,12 +289,18 @@ async function connectToRoom() {
     });
     socket.on("peer-left", () => {
       peerIsReady = false;
+      shareButton.disabled = role !== "host";
       updateTransmissionState(false);
       closePeerConnection();
       updateRemoteTransmissionState(false, remoteParticipantName);
       placeholderTitle.textContent = "A outra pessoa saiu";
       placeholderDescription.textContent = "A tela compartilhada sera encerrada quando a pessoa sair da sala.";
       showStatus("A outra pessoa saiu da sala");
+    });
+    socket.on("media-waiting", ({ message } = {}) => {
+      if (peerIsReady) return;
+      shareButton.disabled = role !== "host";
+      showStatus(message || "Aguardando uma conexão de mídia disponível");
     });
     socket.on("signal", (data) => {
       signalQueue = signalQueue.then(() => handleSignal(data)).catch((error) => {
@@ -302,6 +310,14 @@ async function connectToRoom() {
     });
     socket.on("connect_error", (error) => {
       showStatus(error.message || "Falha na conexao com a sala", "error");
+      if (/sala está cheia/i.test(error.message || "")) {
+        nameEntry.hidden = false;
+        roomGrid.hidden = true;
+        nameMessage.textContent = "Sala está cheia. O limite é de 5 pessoas.";
+        shareButton.disabled = true;
+        socket.disconnect();
+        return;
+      }
       if (/sala invalida|sala expirada/i.test(error.message || "")) socket.disconnect();
     });
     socket.on("disconnect", (reason) => {
@@ -434,7 +450,7 @@ function createPeerConnection() {
         liveLabel.hidden = true;
         playVideoButton.hidden = true;
         placeholderTitle.textContent = "Compartilhamento encerrado";
-        placeholderDescription.textContent = "Qualquer pessoa na sala pode iniciar o compartilhamento.";
+        placeholderDescription.textContent = "A transmissão está disponível apenas para o anfitrião e o visitante conectado ao par de mídia.";
         viewerVideoActive = false;
         transmissionStatus.textContent = "A outra pessoa encerrou o compartilhamento.";
         transmissionStatus.dataset.state = "waiting";
@@ -842,7 +858,7 @@ function stopScreenSharing() {
   if (!remoteVideo.srcObject) {
     videoPlaceholder.hidden = false;
     placeholderTitle.textContent = "Compartilhamento encerrado";
-    placeholderDescription.textContent = "Qualquer pessoa na sala pode iniciar o compartilhamento.";
+    placeholderDescription.textContent = "A transmissão está disponível apenas para o anfitrião e o visitante conectado ao par de mídia.";
   }
   updateTransmissionState(false);
 }
@@ -873,8 +889,9 @@ nameEntry.addEventListener("submit", (event) => {
   roomGrid.hidden = false;
   roomTitle.textContent = role === "host" ? "Sua sala está pronta." : "Você entrou na sala.";
   roomDescription.textContent = role === "host"
-    ? "Envie o link para a outra pessoa entrar. Qualquer participante pode compartilhar a tela."
-    : "Você entrou na sala. Qualquer participante pode compartilhar a tela.";
+    ? "Envie o link para até quatro pessoas entrarem. A mídia ao vivo é ponto a ponto entre o anfitrião e um visitante por vez."
+    : "Você entrou na sala. A mídia ao vivo é ponto a ponto entre o anfitrião e um visitante por vez.";
+  shareButton.disabled = true;
   renderParticipants([{ name: participantName, role }]);
   connectToRoom();
 });
