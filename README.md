@@ -17,7 +17,7 @@ npm install
 npm start
 ```
 
-Abra `http://localhost:3000` no Chrome, Edge, Brave ou Firefox. Em `localhost`, os navegadores permitem captura de tela sem HTTPS. Clique em **Criar uma sala**, informe seu nome e copie o link de convite para abrir em outro navegador ou computador. Qualquer uma das duas pessoas pode clicar em **Compartilhar tela** e escolher uma janela/tela. Na sala, **Sinalizacao conectada** significa que a sala esta acessivel, nao que a tela ja esta sendo enviada: o estado **Envio confirmado** aparece quando novas imagens sao codificadas pelo WebRTC, e **AO VIVO** quando os quadros recebidos podem ser exibidos.
+Abra `http://localhost:3000` no Chrome, Edge, Brave ou Firefox. Em `localhost`, os navegadores permitem captura de tela sem HTTPS. Clique em **Criar uma sala**, informe seu nome e copie o link de convite para abrir em outros navegadores ou computadores. Cada sala aceita ate cinco pessoas, incluindo o anfitriao; a proxima tentativa recebe a mensagem **Sala esta cheia**. Na arquitetura WebRTC atual, a midia ponto a ponto e negociada entre o anfitriao e o primeiro visitante conectado; os demais podem entrar e aparecem na lista, mas nao recebem a tela enquanto essa limitacao existir. Na sala, **Sinalizacao conectada** significa que a sala esta acessivel, nao que a tela ja esta sendo enviada: o estado **Envio confirmado** aparece quando novas imagens sao codificadas pelo WebRTC, e **AO VIVO** quando os quadros recebidos podem ser exibidos.
 
 No PowerShell do Windows, use `npm.cmd` para evitar o bloqueio de scripts `.ps1` da politica de execucao:
 
@@ -108,8 +108,9 @@ Sem um servidor TURN configurado, algumas combinacoes de roteadores, firewalls e
 - O audio da tela e opcional. O navegador pode nao fornecer uma faixa de audio, dependendo do navegador, sistema e origem capturada. O visitante pode ativar ou silenciar o audio recebido.
 - Tela cheia, exibicao de estatisticas, parametros do transmissor, captura e codecs sao verificados por funcionalidade; o nome do navegador e informativo e nao determina o fluxo.
 - Chrome, Microsoft Edge, Brave e Firefox atuais; Windows, macOS e Linux, sujeitos as permissoes e capacidades de captura de cada navegador e sistema.
-- O link de convite permite entrar como visitante; o link privado de anfitriao continua protegido e nao e copiado pelo botao de convite. Qualquer uma das duas pessoas conectadas pode iniciar e encerrar o proprio compartilhamento. Se ambas compartilharem, a tela recebida aparece em destaque e a previa local no canto.
+- O link de convite permite entrar como visitante; o link privado de anfitriao continua protegido e nao e copiado pelo botao de convite. As duas pessoas no par de midia ativo podem iniciar e encerrar o proprio compartilhamento. Se ambas compartilharem, a tela recebida aparece em destaque e a previa local no canto.
 - Ao abrir um link de sala, cada participante informa um nome (ate 32 caracteres); a lista mostra os participantes conectados no momento.
+- Cada sala admite no maximo cinco conexoes (anfitriao + quatro visitantes), controladas no servidor. A capacidade da sala nao altera a arquitetura WebRTC ponto a ponto: atualmente, somente o anfitriao e o primeiro visitante conectado negociam midia.
 - A tela recebida aparece em destaque e a pre-visualizacao local no canto. A indicacao de envio muda para confirmada depois que novas imagens aparecem nas estatisticas WebRTC; o indicador ao vivo aparece quando o video recebido realmente comeca a tocar.
 - A pessoa que transmite confirma quadros codificados (saida WebRTC); a outra pessoa confirma quadros decodificados (entrada) e um quadro de video pronto para exibicao. A falta de novos quadros em um unico intervalo de estatisticas nao encerra o estado ao vivo.
 - A conexao de midia e ponto a ponto com WebRTC; TURN pode retransmitir midia quando necessario.
@@ -125,15 +126,15 @@ npm.cmd test
 npm.cmd run build
 ```
 
-Os testes verificam a criacao de salas, a entrega da aplicacao, a autenticacao de anfitriao, sinalizacao Socket.IO nos dois sentidos, CORS para Pages, compatibilidade da rota WebSocket existente, calculos de metricas e ajuste automatico de qualidade, e validacao da URL do backend no build.
+Os testes verificam a criacao de salas, a entrega da aplicacao, a autenticacao de anfitriao, o limite de cinco participantes e a liberacao de vagas, sinalizacao Socket.IO nos dois sentidos, CORS para Pages, compatibilidade da rota WebSocket existente, calculos de metricas e ajuste automatico de qualidade, e validacao da URL do backend no build.
 
 Os testes automatizados nao simulam os seletores de compartilhamento nem substituem testes reais de Chrome, Edge, Brave e Firefox. Antes de anunciar suporte validado, teste os pares Chrome/Firefox e Brave/Edge em dois dispositivos e redes diferentes, incluindo audio quando oferecido, perda e reconexao, FPS, resolucao, tela cheia e uma sessao prolongada. Esses testes exigem navegadores e dispositivos reais; o servidor de desenvolvimento sozinho nao confirma compatibilidade, desempenho 4K/60 FPS nem conectividade TURN.
 
 ### Teste de transmissao real
 
 1. Abra a URL HTTPS do Pages em dois dispositivos/navegadores suportados e em redes diferentes, se possivel.
-2. No primeiro navegador, crie uma sala, informe o nome e envie o link de convite ao segundo. Ambos devem aparecer na lista de participantes.
-3. Clique em **Compartilhar tela** em um dos dispositivos e autorize a captura no seletor nativo do navegador. Confirme a imagem remota, o estado ao vivo e as estatisticas WebRTC; nao use apenas o indicador de conexao Socket.IO como evidencia.
+2. No primeiro navegador, crie uma sala, informe o nome e envie o link de convite ao segundo. Ambos devem aparecer na lista de participantes. A sala aceita ate cinco pessoas; teste tambem a rejeicao de uma sexta pessoa e a liberacao de uma vaga quando alguem sai.
+3. Clique em **Compartilhar tela** em um dos dispositivos e autorize a captura no seletor nativo do navegador. Confirme a imagem remota, o estado ao vivo e as estatisticas WebRTC; nao use apenas o indicador de conexao Socket.IO como evidencia. A verificacao de midia se aplica ao anfitriao e ao primeiro visitante conectado.
 4. Pare a captura e confirme que o estado volta a indicar espera. Repita no sentido oposto; ambos os participantes podem transmitir.
 5. Se o teste entre redes falhar, repita em redes sem VPN/firewall ou configure um servico TURN externo. Teste audio somente quando o navegador e o sistema operacional oferecerem a faixa.
 

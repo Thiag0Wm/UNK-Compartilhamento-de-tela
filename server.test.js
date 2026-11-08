@@ -54,6 +54,7 @@ test("creates rooms, serves the web app, and relays WebRTC signaling", async () 
     assert.match(pageHtml, /Criar uma sala/);
     assert.match(pageHtml, /id="room-name"/);
     assert.match(pageHtml, /Pessoas na sala/);
+    assert.match(pageHtml, /id="participants-count"[^>]*>0\/5</);
     assert.match(pageHtml, /transmission-status/);
     assert.match(pageHtml, /<title>UNK — Compartilhe sua tela<\/title>/);
     assert.match(pageHtml, /class="brand-logo" src="\/unk-mark\.png"/);
@@ -186,6 +187,64 @@ test("creates rooms, serves the web app, and relays WebRTC signaling", async () 
   } finally {
     for (const client of socketIoClients) client.disconnect();
     for (const socket of sockets) socket.terminate();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("limits rooms to five people and frees a place when someone leaves", async () => {
+  const server = createApplicationServer();
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const clients = [];
+
+  function join(room, name, role = "viewer") {
+    const client = createSocketClient(baseUrl, {
+      auth: {
+        roomId: room.roomId,
+        role,
+        token: role === "host" ? room.hostToken : undefined,
+        name,
+      },
+      reconnection: false,
+      transports: ["websocket"],
+    });
+    clients.push(client);
+    return client;
+  }
+
+  try {
+    const roomResponse = await fetch(`${baseUrl}/api/rooms`, { method: "POST" });
+    const room = await roomResponse.json();
+    const host = join(room, "Anfitriao", "host");
+    const hostConnected = waitForSocketEvent(host, "connect");
+    await hostConnected;
+
+    const participants = [host];
+    for (const name of ["Pessoa 2", "Pessoa 3", "Pessoa 4", "Pessoa 5"]) {
+      const client = join(room, name);
+      const connected = waitForSocketEvent(client, "connect");
+      const participantList = waitForSocketEvent(client, "participants");
+      await Promise.all([connected, participantList]);
+      participants.push(client);
+      assert.equal((await participantList)[0].length, participants.length);
+    }
+
+    const rejected = join(room, "Pessoa 6");
+    const [error] = await waitForSocketEvent(rejected, "connect_error");
+    assert.equal(error.message, "Sala está cheia.");
+
+    const hostParticipantUpdate = waitForSocketEvent(host, "participants");
+    participants[1].disconnect();
+    assert.equal((await hostParticipantUpdate)[0].length, 4);
+
+    const replacement = join(room, "Pessoa 6");
+    const replacementConnected = waitForSocketEvent(replacement, "connect");
+    const replacementParticipants = waitForSocketEvent(replacement, "participants");
+    await Promise.all([replacementConnected, replacementParticipants]);
+    assert.equal((await replacementParticipants)[0].length, 5);
+  } finally {
+    for (const client of clients) client.disconnect();
     await new Promise((resolve) => server.close(resolve));
   }
 });

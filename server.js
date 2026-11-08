@@ -9,6 +9,7 @@ const PORT = Number(process.env.PORT) || 3000;
 const PUBLIC_DIR = path.join(__dirname, "public");
 const ROOM_TTL_MS = 2 * 60 * 60 * 1000;
 const MAX_ROOMS = 1000;
+const MAX_ROOM_PARTICIPANTS = 5;
 const ROOM_ID_PATTERN = /^[a-zA-Z0-9_-]{12,32}$/;
 const TURN_URLS = (process.env.TURN_URL || "")
   .split(",")
@@ -133,6 +134,13 @@ function validSignal(data) {
   return isDescription || isCandidate;
 }
 
+function getMediaPair(room) {
+  const peers = Array.from(room.socketPeers.values()).filter((peer) => peer.connected);
+  const host = peers.find((peer) => peer.data.role === "host");
+  const viewer = peers.find((peer) => peer.data.role === "viewer");
+  return host && viewer ? [host, viewer] : null;
+}
+
 function connectSocketIo(server, allowedOrigins) {
   const io = new SocketIOServer(server, {
     serveClient: true,
@@ -164,6 +172,12 @@ function connectSocketIo(server, allowedOrigins) {
       next(new Error("Informe um nome de 1 a 32 caracteres para entrar na sala."));
       return;
     }
+    const replacingHost = role === "host"
+      && Array.from(room.socketPeers.values()).some((peer) => peer.data.role === "host");
+    if (!replacingHost && room.socketPeers.size + room.peers.size >= MAX_ROOM_PARTICIPANTS) {
+      next(new Error("Sala está cheia."));
+      return;
+    }
     socket.data.room = room;
     socket.data.roomId = roomId;
     socket.data.role = role;
@@ -180,51 +194,94 @@ function connectSocketIo(server, allowedOrigins) {
     }
   }
 
+  function updateMediaPair(room) {
+    const previousPair = room.mediaPair || [];
+    const nextPair = getMediaPair(room);
+    const nextIds = nextPair?.map((peer) => peer.id) || [];
+    const pairUnchanged = previousPair.length === nextIds.length
+      && previousPair.every((id, index) => id === nextIds[index]);
+
+    if (!pairUnchanged) {
+      for (const id of previousPair) {
+        const peer = room.socketPeers.get(id);
+        if (peer?.connected) peer.emit("peer-left");
+      }
+
+      room.mediaPair = nextIds;
+      if (nextPair) {
+        nextPair[0].emit("peer-ready", {
+          peerId: nextPair[1].id,
+          name: nextPair[1].data.name,
+        });
+        nextPair[1].emit("peer-ready", {
+          peerId: nextPair[0].id,
+          name: nextPair[0].data.name,
+        });
+        for (const [peer, otherPeer] of [[nextPair[0], nextPair[1]], [nextPair[1], nextPair[0]]]) {
+          if (otherPeer.data.sharing) {
+            peer.emit("sharing-state", { active: true, name: otherPeer.data.name });
+          }
+        }
+      }
+    }
+
+    const pairedIds = new Set(room.mediaPair || []);
+    for (const peer of room.socketPeers.values()) {
+      if (peer.connected && !pairedIds.has(peer.id)) {
+        peer.emit("media-waiting", {
+          message: "A mídia ao vivo é ponto a ponto entre o anfitrião e um visitante por vez.",
+        });
+      }
+    }
+  }
+
   io.on("connection", (socket) => {
     const room = socket.data.room;
     const role = socket.data.role;
-    const otherRole = role === "host" ? "viewer" : "host";
-    const replacedPeer = room.socketPeers.get(role);
-    if (replacedPeer) replacedPeer.disconnect(true);
-    room.socketPeers.set(role, socket);
+    if (role === "host") {
+      const existingHost = Array.from(room.socketPeers.values())
+        .find((peer) => peer.data.role === "host");
+      if (existingHost) existingHost.disconnect(true);
+    }
+    if (room.socketPeers.size + room.peers.size >= MAX_ROOM_PARTICIPANTS) {
+      socket.emit("room-full", { message: "Sala está cheia." });
+      socket.disconnect(true);
+      return;
+    }
+    room.socketPeers.set(socket.id, socket);
     socket.data.sharing = false;
     room.expiresAt = Date.now() + ROOM_TTL_MS;
     socket.emit("joined", { role, name: socket.data.name });
     broadcastParticipants(room);
-
-    const otherPeer = room.socketPeers.get(otherRole);
-    if (otherPeer?.connected) {
-      otherPeer.emit("peer-ready");
-      socket.emit("peer-ready");
-      if (otherPeer.data.sharing) {
-        socket.emit("sharing-state", { active: true, name: otherPeer.data.name });
-      }
-    }
+    updateMediaPair(room);
 
     socket.on("signal", (data) => {
       if (!validSignal(data)) {
         socket.disconnect(true);
         return;
       }
-      const peer = room.socketPeers.get(otherRole);
+      if (!room.mediaPair?.includes(socket.id)) return;
+      const peerId = room.mediaPair.find((id) => id !== socket.id);
+      const peer = room.socketPeers.get(peerId);
       if (peer?.connected) peer.emit("signal", data);
     });
 
     socket.on("sharing-state", (data) => {
       if (typeof data?.active !== "boolean") return;
       socket.data.sharing = data.active;
-      const peer = room.socketPeers.get(otherRole);
+      if (!room.mediaPair?.includes(socket.id)) return;
+      const peerId = room.mediaPair.find((id) => id !== socket.id);
+      const peer = room.socketPeers.get(peerId);
       if (peer?.connected) {
         peer.emit("sharing-state", { active: data.active, name: socket.data.name });
       }
     });
 
     socket.on("disconnect", () => {
-      if (room.socketPeers.get(role) !== socket) return;
-      room.socketPeers.delete(role);
+      if (room.socketPeers.get(socket.id) !== socket) return;
+      room.socketPeers.delete(socket.id);
       broadcastParticipants(room);
-      const peer = room.socketPeers.get(otherRole);
-      if (peer?.connected) peer.emit("peer-left");
+      updateMediaPair(room);
       if (!room.peers.size && !room.socketPeers.size) {
         room.expiresAt = Date.now() + ROOM_TTL_MS;
       }
@@ -393,6 +450,15 @@ function createApplicationServer(options = {}) {
     if (url.pathname !== "/signal" || !room || !ROOM_ID_PATTERN.test(roomId)
       || (role !== "viewer" && !tokenMatches)) {
       socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    const replacingLegacyPeer = room.peers.has(role);
+    const replacingHostSocket = role === "host"
+      && Array.from(room.socketPeers.values()).some((peer) => peer.data.role === "host");
+    if (!replacingLegacyPeer && !replacingHostSocket
+      && room.peers.size + room.socketPeers.size >= MAX_ROOM_PARTICIPANTS) {
+      socket.write("HTTP/1.1 409 Conflict\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nSala está cheia.");
       socket.destroy();
       return;
     }
