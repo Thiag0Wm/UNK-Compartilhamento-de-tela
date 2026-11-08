@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: unk-screen-share
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TURN_URL
+        sync: false
+      - key: TURN_SHARED_SECRET
+        sync: false
+      - key: TURN_CREDENTIAL_TTL
+        value: "3600"
+      - key: PUBLIC_APP_ORIGINS
+        sync: false
