@@ -53,6 +53,7 @@ let role = null;
 let roomId = null;
 let participantName = "";
 let remoteParticipantName = "";
+let remotePeerId = null;
 let hostToken = null;
 let socket = null;
 let peerConnection = null;
@@ -103,7 +104,7 @@ function setRoomView() {
   roomTitle.textContent = "Entre na sala.";
   roomDescription.textContent = "Informe seu nome para entrar e aparecer na lista de participantes.";
   placeholderTitle.textContent = "Aguardando compartilhamento";
-  placeholderDescription.textContent = "A mídia ao vivo é ponto a ponto entre o anfitrião e um visitante por vez.";
+  placeholderDescription.textContent = "Até duas pessoas podem compartilhar a tela ao mesmo tempo.";
   shareButton.disabled = true;
   roomNameInput.focus();
   roomEyebrow.innerHTML = '<span class="eyebrow-line"></span> SALA DE COMPARTILHAMENTO';
@@ -117,7 +118,8 @@ function setRoomView() {
 }
 
 function renderParticipants(participants) {
-  remoteParticipantName = participants.find((participant) => participant.role !== role)?.name || "";
+  remoteParticipantName = participants.find((participant) => participant.id === remotePeerId)?.name
+    || remoteParticipantName;
   participantsCount.textContent = `${participants.length}/5`;
   participantsList.replaceChildren();
   if (!participants.length) {
@@ -142,7 +144,7 @@ function renderParticipants(participants) {
     const label = document.createElement("span");
     label.className = "participant-role";
     item.dataset.role = participant.role;
-    label.textContent = `${participant.role === "host" ? "Anfitrião" : "Visitante"}${participant.role === role ? " · Você" : ""}`;
+    label.textContent = `${participant.role === "host" ? "Anfitrião" : "Visitante"}${participant.role === role ? " · Você" : ""}${participant.sharing ? " · Compartilhando" : ""}`;
     details.append(name, label);
     item.append(avatar, details);
     participantsList.append(item);
@@ -272,37 +274,49 @@ async function connectToRoom() {
     });
     socket.on("joined", () => {
       showStatus("Sinalização conectada; aguardando transmissão");
+      shareButton.disabled = false;
       socket.emit("sharing-state", { active: isActuallyTransmitting });
+      if (screenStream) {
+        requestSharingSlot(true).catch((error) => {
+          showError(shareMessage, error);
+          stopScreenSharing();
+        });
+      }
     });
     socket.on("participants", renderParticipants);
     socket.on("sharing-state", ({ active, name }) => updateRemoteTransmissionState(active, name));
-    socket.on("peer-ready", () => {
+    socket.on("peer-ready", ({ peerId, name } = {}) => {
       peerIsReady = true;
+      remotePeerId = peerId || null;
+      remoteParticipantName = name || "";
       shareButton.disabled = false;
-      showStatus("Outra pessoa entrou; mídia aguardando a tela");
-      placeholderTitle.textContent = "A outra pessoa entrou";
+      showStatus(`Conectado com ${remoteParticipantName || "outra pessoa"}; mídia ponto a ponto ativa`);
+      placeholderTitle.textContent = `${remoteParticipantName || "Outra pessoa"} conectada`;
       placeholderDescription.textContent = screenStream
         ? "Sua tela está pronta para ser enviada. O envio será confirmado quando houver quadros WebRTC."
-        : "Você ou a outra pessoa podem iniciar o compartilhamento.";
+        : "Você ou essa pessoa podem iniciar o compartilhamento.";
       if (screenStream) updateTransmissionState(false);
       createPeerConnection();
     });
     socket.on("peer-left", () => {
       peerIsReady = false;
-      shareButton.disabled = role !== "host";
+      remotePeerId = null;
+      remoteParticipantName = "";
+      shareButton.disabled = false;
       updateTransmissionState(false);
       closePeerConnection();
       updateRemoteTransmissionState(false, remoteParticipantName);
-      placeholderTitle.textContent = "A outra pessoa saiu";
-      placeholderDescription.textContent = "A tela compartilhada sera encerrada quando a pessoa sair da sala.";
+      placeholderTitle.textContent = "A conexão de mídia foi encerrada";
+      placeholderDescription.textContent = "Quando outra pessoa iniciar ou parar de compartilhar, a conexão será atualizada.";
       showStatus("A outra pessoa saiu da sala");
     });
     socket.on("media-waiting", ({ message } = {}) => {
       if (peerIsReady) return;
-      shareButton.disabled = role !== "host";
+      shareButton.disabled = false;
       showStatus(message || "Aguardando uma conexão de mídia disponível");
     });
     socket.on("signal", (data) => {
+      if (data.peerId !== remotePeerId) return;
       signalQueue = signalQueue.then(() => handleSignal(data)).catch((error) => {
         console.error("Falha ao negociar a conexao:", error);
         showStatus("Falha ao conectar as telas. Atualize a pagina.", "error");
@@ -400,7 +414,29 @@ function playLocalPreview() {
 }
 
 function sendSignal(data) {
-  if (socket?.connected) socket.emit("signal", data);
+  if (socket?.connected && remotePeerId) {
+    socket.emit("signal", { ...data, peerId: remotePeerId });
+  }
+}
+
+function requestSharingSlot(active) {
+  return new Promise((resolve, reject) => {
+    if (!socket?.connected) {
+      reject(new Error("Conecte-se à sala antes de compartilhar a tela."));
+      return;
+    }
+    socket.timeout(5000).emit("request-sharing", { active }, (error, result) => {
+      if (error) {
+        reject(new Error("Não foi possível reservar uma vaga de compartilhamento. Tente novamente."));
+        return;
+      }
+      if (!result?.ok) {
+        reject(new Error(result?.message || "Não foi possível iniciar o compartilhamento."));
+        return;
+      }
+      resolve();
+    });
+  });
 }
 
 function createPeerConnection() {
@@ -450,7 +486,7 @@ function createPeerConnection() {
         liveLabel.hidden = true;
         playVideoButton.hidden = true;
         placeholderTitle.textContent = "Compartilhamento encerrado";
-        placeholderDescription.textContent = "A transmissão está disponível apenas para o anfitrião e o visitante conectado ao par de mídia.";
+        placeholderDescription.textContent = "Qualquer participante pode iniciar uma transmissão; até duas telas podem ser compartilhadas por vez.";
         viewerVideoActive = false;
         transmissionStatus.textContent = "A outra pessoa encerrou o compartilhamento.";
         transmissionStatus.dataset.state = "waiting";
@@ -583,7 +619,7 @@ async function handleSignal(data) {
   if (data.type === "offer" || data.type === "answer") {
     const description = data.description;
     if (!description || !["offer", "answer"].includes(description.type)) return;
-    const polite = role === "viewer";
+    const polite = socket.id > remotePeerId;
     const offerCollision = description.type === "offer"
       && (makingOffer || (connection.signalingState !== "stable" && !settingRemoteAnswerPending));
     ignoreOffer = !polite && offerCollision;
@@ -789,6 +825,7 @@ async function toggleScreenSharing() {
       throw new Error("O navegador nao forneceu uma faixa de video para a tela selecionada.");
     }
 
+    await requestSharingSlot(true);
     localPreview.srcObject = screenStream;
     localPreview.hidden = false;
     playLocalPreview();
@@ -824,6 +861,9 @@ async function toggleScreenSharing() {
     updateTransmissionState(false);
   } catch (error) {
     if (screenStream) {
+      if (socket?.connected) {
+        socket.emit("request-sharing", { active: false });
+      }
       for (const track of screenStream.getTracks()) track.stop();
       screenStream = null;
     }
@@ -841,6 +881,9 @@ function stopScreenSharing() {
   const stream = screenStream;
   screenStream = null;
   if (!stream) return;
+  if (socket?.connected) {
+    socket.emit("request-sharing", { active: false });
+  }
   const tracks = stream.getTracks();
   const senders = peerConnection?.getSenders() || [];
   const replacements = tracks.map((track) => {
@@ -858,7 +901,7 @@ function stopScreenSharing() {
   if (!remoteVideo.srcObject) {
     videoPlaceholder.hidden = false;
     placeholderTitle.textContent = "Compartilhamento encerrado";
-    placeholderDescription.textContent = "A transmissão está disponível apenas para o anfitrião e o visitante conectado ao par de mídia.";
+    placeholderDescription.textContent = "Qualquer participante pode iniciar uma transmissão; até duas telas podem ser compartilhadas por vez.";
   }
   updateTransmissionState(false);
 }
@@ -889,8 +932,8 @@ nameEntry.addEventListener("submit", (event) => {
   roomGrid.hidden = false;
   roomTitle.textContent = role === "host" ? "Sua sala está pronta." : "Você entrou na sala.";
   roomDescription.textContent = role === "host"
-    ? "Envie o link para até quatro pessoas entrarem. A mídia ao vivo é ponto a ponto entre o anfitrião e um visitante por vez."
-    : "Você entrou na sala. A mídia ao vivo é ponto a ponto entre o anfitrião e um visitante por vez.";
+    ? "Envie o link para até quatro pessoas. Duas pessoas podem transmitir ao mesmo tempo; qualquer participante pode iniciar."
+    : "Até duas pessoas podem transmitir ao mesmo tempo. Inicie quando quiser; não é necessário ser anfitrião.";
   shareButton.disabled = true;
   renderParticipants([{ name: participantName, role }]);
   connectToRoom();
