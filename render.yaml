@@ -3,7 +3,7 @@ services:
     name: unk-screen-share
     runtime: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm ci
     startCommand: npm start
     healthCheckPath: /api/health
     envVars:

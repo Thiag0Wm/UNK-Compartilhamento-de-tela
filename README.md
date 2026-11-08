@@ -27,18 +27,68 @@ npm.cmd start
 
 Se o terminal nao encontrar `node` ou `npm.cmd`, feche e reabra o VS Code para carregar o PATH atualizado.
 
-## Publicar online
+## Publicar online (Render + Cloudflare Pages)
 
-O backend requer Node.js, Socket.IO e memoria de processo para manter as salas; Cloudflare Pages sozinho nao pode hospedar esse servidor. Use Cloudflare Pages para os arquivos estaticos e Render para o backend:
+O Render hospeda o backend Node.js, salas e sinalizacao; o Cloudflare Pages hospeda os arquivos estaticos. O video continua ponto a ponto por WebRTC. O aplicativo nao exige conta dos participantes, instalacao ou extensao.
 
-1. No Render, crie um Blueprint a partir deste repositorio. O arquivo `render.yaml` configura o servico Node e o health check. Anote o endereco HTTPS atribuido ao servico.
-2. No Cloudflare Pages, conecte o mesmo repositorio, use `npm ci && npm run build` como comando de build e `public` como diretorio de saida. Defina `UNK_API_BASE_URL` com a origem HTTPS do servico Render, por exemplo `https://unk-screen-share.onrender.com`.
-3. Configure `PUBLIC_APP_ORIGINS` no servico Render com a origem exata do site Pages, como `https://unk-screen-share.pages.dev`. O backend aceita APIs e Socket.IO somente dessa origem e da propria origem do servidor.
-4. Configure `TURN_URL` e `TURN_SHARED_SECRET` no Render para oferecer TURN em redes restritivas. O servidor rejeita requisicoes HTTP em producao; use os enderecos HTTPS.
+### Requisitos e variaveis
 
-O build copia o cliente Socket.IO para `public` e grava a origem configurada em `public/config.js`; localmente, uma origem vazia usa o proprio servidor.
+- Node.js 20 ou superior (declarado em `package.json`).
+- Uma conta Render ligada ao repositorio e uma conta Cloudflare ligada ao GitHub.
+- HTTPS na origem do Pages e na origem do backend. Em producao, o servidor recusa HTTP.
+- O dominio publico do Pages e o dominio HTTPS atribuido ao servico web do Render.
 
-Salas e sinalizacao ficam na memoria do processo e expiram depois de duas horas sem participantes. Mantenha uma unica instancia do servico: o uso de multiplas instancias exige um armazenamento compartilhado e um transporte de sinalizacao pub/sub.
+| Variavel | Plataforma | Obrigatoria | Valor |
+| --- | --- | --- | --- |
+| `PUBLIC_APP_ORIGINS` | Render | Sim para o Pages acessar o backend | Origem exata do Pages, por exemplo `https://unk-screen-share.pages.dev`, sem caminho nem barra final. Multiplas origens podem ser separadas por virgula. |
+| `TURN_URL` | Render | Nao | URLs `turn:`/`turns:` fornecidas pelo servico TURN escolhido, separadas por virgula. |
+| `TURN_SHARED_SECRET` | Render | Nao, exceto quando `TURN_URL` e definido | Segredo fornecido pela configuracao do servidor TURN. Nunca o publique ou coloque no Pages. |
+| `TURN_CREDENTIAL_TTL` | Render | Nao | Validade das credenciais em segundos; padrao 3600, permitido de 300 a 86400. |
+| `UNK_API_BASE_URL` | Cloudflare Pages | Sim | Origem HTTPS do servico Render, por exemplo `https://unk-screen-share.onrender.com`. Nao adicione caminho, token ou segredo. |
+
+`TURN_URL` e `TURN_SHARED_SECRET` precisam ser definidos juntos ou deixados ambos vazios. Sem TURN, o backend fornece STUN por padrao. TURN e um servico separado: hospedar no Render nao cria nem garante um servidor TURN compativel. Nao ha credenciais ou servidor TURN gratuito embutidos neste projeto.
+
+### Passo a passo de publicacao
+
+1. **Criar o backend no Render.** No painel Render, crie um Blueprint a partir de `Thiag0Wm/UNK-Compartilhamento-de-tela` e use o `render.yaml` do repositorio. O servico usa runtime Node, `npm ci`, `npm start` e o health check `/api/health`; a versao minima de Node vem de `package.json`. O Render fornece a variavel `PORT`. Deixe `TURN_URL` e `TURN_SHARED_SECRET` vazios inicialmente e mantenha `TURN_CREDENTIAL_TTL` em `3600`.
+2. **Preencher `PUBLIC_APP_ORIGINS`.** Ao criar o servico, o endereco Pages talvez ainda nao exista. Use temporariamente uma origem que nao seja um site real, como `https://placeholder.invalid`, para que nenhuma origem desconhecida seja autorizada. Depois que o Pages estiver criado, substitua esse valor pela origem Pages exata. Nao use `*`.
+3. **Verificar o backend.** Aguarde o deploy e abra `https://<servico>.onrender.com/api/health`. A resposta esperada e `{"status":"ok"}`. Guarde apenas a origem `https://<servico>.onrender.com`, sem `/api/health`.
+4. **Criar o projeto Pages.** No Cloudflare Pages, conecte o mesmo repositorio e branch de producao. Configure o comando de build como `npm ci && npm run build` e o diretorio de saida como `public`. Em **Settings > Variables and Secrets**, crie `UNK_API_BASE_URL` como variavel de build de producao e defina a origem HTTPS do Render.
+5. **Publicar e autorizar a origem.** Aguarde o primeiro deploy do Pages e copie a origem atribuida, por exemplo `https://<projeto>.pages.dev`. No Render, altere `PUBLIC_APP_ORIGINS` para essa origem exata e salve/republique o backend. Se for usar dominios customizados ou deploy previews, inclua cada origem explicitamente; o CORS nao libera previews automaticamente.
+6. **Validar os dois servicos.** Abra o Pages, crie uma sala e confirme que o pedido `POST /api/rooms` retorna HTTP 201 e que a conexao Socket.IO permanece conectada. Depois teste a transmissao real entre dois navegadores/dispositivos seguindo a secao de diagnostico.
+
+O build gera `public/config.js` com `UNK_API_BASE_URL`, copia o cliente Socket.IO para `public/socket.io-client.js` e restringe `connect-src` no CSP do Pages a origem HTTPS e ao endpoint WSS correspondente. Quando a variavel estiver vazia, a configuracao gerada tambem fica vazia e a aplicacao usa a propria origem, mantendo a execucao local. O build rejeita URLs remotas HTTP e URLs com credenciais, caminho ou query string.
+
+### Configuracao do Render e limites de disponibilidade
+
+`render.yaml` cria um unico servico web gratuito, sem configurar escalabilidade horizontal. As salas, tokens e sinalizacao ficam na memoria desse unico processo; mantenha **uma instancia**. Reiniciar ou suspender o processo elimina salas ativas. O plano gratuito do Render pode suspender servicos inativos e provocar atraso de inicializacao, e seus limites/disponibilidade podem mudar. Isso nao equivale a uma sessao sempre ativa nem a armazenamento duravel.
+
+Salas sem participantes expiram apos duas horas; a atividade de participantes atualiza a expiracao. Mesmo dentro desse prazo, uma suspensao ou reinicializacao do processo pode encerrar a sala. Multiplas instancias exigiriam armazenamento compartilhado para salas e um transporte pub/sub para sinalizacao, que este projeto nao configura.
+
+### Atualizar a aplicacao
+
+Envie as alteracoes para o branch conectado ao Render e ao Pages. O Render recompila e inicia o backend; o Pages roda `npm ci && npm run build` e publica `public`. Se o endereco do backend mudar, atualize `UNK_API_BASE_URL` no Pages e inicie um novo deploy. Se o dominio do Pages mudar, atualize `PUBLIC_APP_ORIGINS` no Render. Alteracoes em variaveis de build do Pages so aparecem em um novo build.
+
+### Diagnostico rapido (Windows/PowerShell)
+
+```powershell
+# Confirme o backend e a resposta JSON
+Invoke-RestMethod "https://<servico>.onrender.com/api/health"
+
+# Confirme que uma origem nao permitida e recusada (esperado: HTTP 403)
+Invoke-WebRequest "https://<servico>.onrender.com/api/rooms" `
+  -Method Post `
+  -Headers @{ Origin = "https://origem-nao-autorizada.example" }
+```
+
+Para diagnosticar pelo navegador:
+
+- Em **DevTools > Network**, confirme que `POST /api/rooms` e `GET /api/ice` usam a origem Render e nao falham com CORS. A criacao de sala deve retornar HTTP 201.
+- Confirme a conexao Socket.IO na aba Network (WebSocket ou polling) e procure erros de CORS/403 no console. Em producao, a pagina HTTPS deve conectar ao backend com HTTPS/WSS.
+- Se a sala abrir mas nao conectar, confirme que `PUBLIC_APP_ORIGINS` corresponde exatamente a origem Pages, sem barra final, e que o servico Render terminou de iniciar. No plano gratuito, aguarde a inicializacao a frio e tente novamente.
+- Sem TURN, algumas redes corporativas, VPNs e roteadores podem impedir WebRTC mesmo que a sinalizacao Socket.IO esteja conectada. Configure um servidor TURN externo e suas credenciais no Render para essas redes.
+- Se uma sala parar de funcionar apos deploy, suspensao ou reinicializacao do Render, crie outra sala: os dados em memoria nao sobrevivem ao processo.
+- Nao interprete “Sinalizacao conectada” como prova de video. A confirmacao de envio/recepcao e o estado ao vivo dependem de quadros e estatisticas WebRTC reais.
 
 ### TURN para redes restritivas
 
@@ -65,6 +115,24 @@ Sem um servidor TURN configurado, algumas combinacoes de roteadores, firewalls e
 
 ## Validacao
 
-Execute `npm test` para verificar a criacao de salas, a entrega da aplicacao, a autenticacao de anfitriao, a sinalizacao por Socket.IO, a compatibilidade da rota WebSocket existente e os calculos de metricas e ajuste automatico de qualidade.
+Instale dependencias e execute os testes no Windows/PowerShell com:
+
+```powershell
+npm.cmd ci
+npm.cmd test
+npm.cmd run build
+```
+
+Os testes verificam a criacao de salas, a entrega da aplicacao, a autenticacao de anfitriao, sinalizacao Socket.IO nos dois sentidos, CORS para Pages, compatibilidade da rota WebSocket existente, calculos de metricas e ajuste automatico de qualidade, e validacao da URL do backend no build.
 
 Os testes automatizados nao simulam os seletores de compartilhamento nem substituem testes reais de Chrome, Edge, Brave e Firefox. Antes de anunciar suporte validado, teste os pares Chrome/Firefox e Brave/Edge em dois dispositivos e redes diferentes, incluindo audio quando oferecido, perda e reconexao, FPS, resolucao, tela cheia e uma sessao prolongada. Esses testes exigem navegadores e dispositivos reais; o servidor de desenvolvimento sozinho nao confirma compatibilidade, desempenho 4K/60 FPS nem conectividade TURN.
+
+### Teste de transmissao real
+
+1. Abra a URL HTTPS do Pages em dois dispositivos/navegadores suportados e em redes diferentes, se possivel.
+2. No primeiro navegador, crie uma sala, informe o nome e envie o link de convite ao segundo. Ambos devem aparecer na lista de participantes.
+3. Clique em **Compartilhar tela** em um dos dispositivos e autorize a captura no seletor nativo do navegador. Confirme a imagem remota, o estado ao vivo e as estatisticas WebRTC; nao use apenas o indicador de conexao Socket.IO como evidencia.
+4. Pare a captura e confirme que o estado volta a indicar espera. Repita no sentido oposto; ambos os participantes podem transmitir.
+5. Se o teste entre redes falhar, repita em redes sem VPN/firewall ou configure um servico TURN externo. Teste audio somente quando o navegador e o sistema operacional oferecerem a faixa.
+
+Os testes automatizados nao comprovam que uma transmissao de producao funciona em dispositivos, navegadores ou redes reais. Este repositorio nao foi implantado nem testado em uma conta Render/Cloudflare por esses testes locais.
