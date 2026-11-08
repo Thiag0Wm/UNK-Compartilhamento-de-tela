@@ -192,61 +192,6 @@ function connectSocketIo(server, allowedOrigins) {
     }
   }
 
-  function getMediaPair(room) {
-    const activeSharers = Array.from(room.shareRequests)
-      .map((id) => room.socketPeers.get(id))
-      .filter((peer) => peer?.connected);
-    if (activeSharers.length >= 2) return activeSharers.slice(0, 2);
-    if (activeSharers.length === 1) {
-      const receiver = Array.from(room.socketPeers.values())
-        .find((peer) => peer.connected && peer.id !== activeSharers[0].id);
-      return receiver ? [activeSharers[0], receiver] : [];
-    }
-    return [];
-  }
-
-  function updateMediaPair(room) {
-    const previousPair = room.mediaPair || [];
-    const nextPair = getMediaPair(room);
-    const nextIds = nextPair.map((peer) => peer.id);
-    const pairUnchanged = previousPair.length === nextIds.length
-      && previousPair.every((id, index) => id === nextIds[index]);
-
-    if (!pairUnchanged) {
-      for (const id of previousPair) {
-        const peer = room.socketPeers.get(id);
-        if (peer?.connected) peer.emit("peer-left");
-      }
-
-      room.mediaPair = nextIds;
-      if (nextPair.length === 2) {
-        nextPair[0].emit("peer-ready", {
-          peerId: nextPair[1].id,
-          name: nextPair[1].data.name,
-        });
-        nextPair[1].emit("peer-ready", {
-          peerId: nextPair[0].id,
-          name: nextPair[0].data.name,
-        });
-      }
-    }
-
-    const pairedIds = new Set(room.mediaPair || []);
-    for (const peer of room.socketPeers.values()) {
-      if (!peer.connected || pairedIds.has(peer.id)) continue;
-      if (room.mediaPair.length === 2) {
-        const message = room.shareRequests.size >= 2
-          ? "Duas pessoas já estão compartilhando. Você pode iniciar quando uma delas parar."
-          : "Uma pessoa está compartilhando. Você também pode iniciar para formar o par de transmissão.";
-        peer.emit("media-waiting", { message });
-      } else if (room.shareRequests.has(peer.id)) {
-        peer.emit("media-waiting", {
-          message: "Sua tela está reservada. Aguarde outra pessoa entrar para conectar a mídia.",
-        });
-      }
-    }
-  }
-
   io.on("connection", (socket) => {
     const room = socket.data.room;
     const role = socket.data.role;
@@ -265,21 +210,30 @@ function connectSocketIo(server, allowedOrigins) {
     room.expiresAt = Date.now() + ROOM_TTL_MS;
     socket.emit("joined", { role, name: socket.data.name });
     broadcastParticipants(room);
-    updateMediaPair(room);
+    for (const peer of room.socketPeers.values()) {
+      if (peer.id === socket.id || !peer.connected) continue;
+      socket.emit("peer-ready", {
+        peerId: peer.id,
+        name: peer.data.name,
+        sharing: peer.data.sharing,
+      });
+      peer.emit("peer-ready", {
+        peerId: socket.id,
+        name: socket.data.name,
+        sharing: socket.data.sharing,
+      });
+    }
 
     socket.on("signal", (data) => {
       if (!validSignal(data)) {
         socket.disconnect(true);
         return;
       }
-      if (!room.mediaPair?.includes(socket.id)) return;
-      const peerId = room.mediaPair.find((id) => id !== socket.id);
-      if (data.peerId && data.peerId !== peerId) return;
+      const peerId = data.peerId;
       const peer = room.socketPeers.get(peerId);
-      if (peer?.connected) {
-        const { peerId: _targetPeerId, ...signalData } = data;
-        peer.emit("signal", { ...signalData, peerId: socket.id });
-      }
+      if (!peer?.connected || peer.id === socket.id) return;
+      const { peerId: _targetPeerId, ...signalData } = data;
+      peer.emit("signal", { ...signalData, peerId: socket.id });
     });
 
     socket.on("request-sharing", (data, acknowledge = () => {}) => {
@@ -295,19 +249,23 @@ function connectSocketIo(server, allowedOrigins) {
 
       if (data.active) room.shareRequests.add(socket.id);
       else room.shareRequests.delete(socket.id);
+      socket.data.sharing = data.active;
       broadcastParticipants(room);
-      updateMediaPair(room);
+      for (const peer of room.socketPeers.values()) {
+        if (peer.id !== socket.id && peer.connected) {
+          peer.emit("sharing-state", { active: data.active, name: socket.data.name, peerId: socket.id });
+        }
+      }
       acknowledge({ ok: true });
     });
 
     socket.on("sharing-state", (data) => {
       if (typeof data?.active !== "boolean") return;
       socket.data.sharing = data.active;
-      if (!room.mediaPair?.includes(socket.id)) return;
-      const peerId = room.mediaPair.find((id) => id !== socket.id);
-      const peer = room.socketPeers.get(peerId);
-      if (peer?.connected) {
-        peer.emit("sharing-state", { active: data.active, name: socket.data.name });
+      for (const peer of room.socketPeers.values()) {
+        if (peer.id !== socket.id && peer.connected) {
+          peer.emit("sharing-state", { active: data.active, name: socket.data.name, peerId: socket.id });
+        }
       }
     });
 
@@ -316,7 +274,9 @@ function connectSocketIo(server, allowedOrigins) {
       room.socketPeers.delete(socket.id);
       room.shareRequests.delete(socket.id);
       broadcastParticipants(room);
-      updateMediaPair(room);
+      for (const peer of room.socketPeers.values()) {
+        if (peer.connected) peer.emit("peer-left", { peerId: socket.id });
+      }
       if (!room.peers.size && !room.socketPeers.size) {
         room.expiresAt = Date.now() + ROOM_TTL_MS;
       }
@@ -415,7 +375,6 @@ function createApplicationServer(options = {}) {
         peers: new Map(),
         socketPeers: new Map(),
         shareRequests: new Set(),
-        mediaPair: [],
       });
       sendJson(response, 201, { roomId: id, hostToken });
       return;

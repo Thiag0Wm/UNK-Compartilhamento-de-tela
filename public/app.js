@@ -14,6 +14,7 @@ const copyMessage = document.querySelector("#copy-message");
 const connectionStatus = document.querySelector("#connection-status");
 const statusText = connectionStatus.querySelector("span:last-child");
 const remoteVideo = document.querySelector("#remote-video");
+const remoteStreams = document.querySelector("#remote-streams");
 const localPreview = document.querySelector("#local-preview");
 const videoFrame = document.querySelector(".video-frame");
 const videoPlaceholder = document.querySelector("#video-placeholder");
@@ -53,24 +54,20 @@ let role = null;
 let roomId = null;
 let participantName = "";
 let remoteParticipantName = "";
-let remotePeerId = null;
 let hostToken = null;
 let socket = null;
 let peerConnection = null;
+const peerConnections = new Map();
+const remoteStreamElements = new Map();
 let screenStream = null;
 let peerIsReady = false;
 let iceServers = [];
 let statsTimer = null;
 let statsSample = null;
 let statsRequestPending = false;
-let pendingCandidates = [];
 let playbackBlocked = false;
 let signalQueue = Promise.resolve();
 let qualityApplyQueue = Promise.resolve();
-let makingOffer = false;
-let negotiationPending = false;
-let ignoreOffer = false;
-let settingRemoteAnswerPending = false;
 let selectedProfile = window.TelaQuality.makeProfile(1080, 30);
 let adaptiveController = window.TelaQuality.createAdaptiveController();
 let isActuallyTransmitting = false;
@@ -118,8 +115,14 @@ function setRoomView() {
 }
 
 function renderParticipants(participants) {
-  remoteParticipantName = participants.find((participant) => participant.id === remotePeerId)?.name
-    || remoteParticipantName;
+  for (const participant of participants) {
+    const peer = peerConnections.get(participant.id);
+    if (peer) {
+      peer.name = participant.name;
+      peer.sharing = participant.sharing;
+    }
+  }
+  updateStatsConnection();
   participantsCount.textContent = `${participants.length}/5`;
   participantsList.replaceChildren();
   if (!participants.length) {
@@ -160,32 +163,66 @@ function markRemoteVideoActive() {
   playVideoButton.hidden = true;
   liveLabel.hidden = false;
   liveText.textContent = "AO VIVO";
-  transmissionStatus.textContent = screenStream && isActuallyTransmitting
-    ? `Sua tela está sendo transmitida; você também está vendo a tela de ${remoteParticipantName || "a outra pessoa"}.`
-    : `Você está vendo a tela de ${remoteParticipantName || "a outra pessoa"}.`;
-  transmissionStatus.dataset.state = "active";
+  updateRemoteViewStatus();
   return true;
+}
+
+function updateRemoteViewStatus() {
+  const screens = remoteStreamElements.size
+    ? "as telas compartilhadas na sala"
+    : `a tela de ${remoteParticipantName || "outra pessoa"}`;
+  transmissionStatus.textContent = screenStream && isActuallyTransmitting
+    ? `Sua tela está sendo transmitida; você também está vendo ${screens}.`
+    : `Você está vendo ${screens}.`;
+  transmissionStatus.dataset.state = "active";
+}
+
+function promoteRemoteStream() {
+  for (const [peerId, tile] of remoteStreamElements) {
+    const video = tile.querySelector("video");
+    const stream = video?.srcObject;
+    if (!stream?.getVideoTracks().some((track) => track.readyState === "live")) continue;
+    remoteVideo.srcObject = stream;
+    remoteParticipantName = peerConnections.get(peerId)?.name || "a outra pessoa";
+    tile.remove();
+    remoteStreamElements.delete(peerId);
+    updateRemoteAudio(stream);
+    playRemoteVideo(stream);
+    return true;
+  }
+  return false;
 }
 
 function updateTransmissionState(active) {
   const changed = active !== isActuallyTransmitting;
   isActuallyTransmitting = active;
+  if (changed && socket?.connected) socket.emit("sharing-state", { active });
   if (active) {
     transmissionStatus.textContent = "Envio confirmado: o WebRTC está transmitindo seus quadros de vídeo.";
     transmissionStatus.dataset.state = "active";
     liveText.textContent = "ENVIANDO TELA";
   } else if (screenStream) {
-    transmissionStatus.textContent = peerIsReady
-      ? "Captura ativa nesta tela; aguardando confirmação de envio pelo WebRTC."
-      : "Prévia local ativa; aguardando a outra pessoa entrar para iniciar o envio.";
+    const remoteVideoActive = remoteVideo.srcObject?.getVideoTracks()
+      .some((track) => track.readyState === "live");
+    transmissionStatus.textContent = remoteVideoActive
+      ? "Captura local ativa; aguardando confirmação do envio. Você também está recebendo uma tela."
+      : peerIsReady
+        ? "Captura ativa nesta tela; aguardando confirmação de envio pelo WebRTC."
+        : "Prévia local ativa; aguardando a outra pessoa entrar para iniciar o envio.";
     transmissionStatus.dataset.state = "waiting";
     liveText.textContent = "PRÉVIA LOCAL";
   } else {
-    transmissionStatus.textContent = "Nenhuma tela está sendo transmitida.";
-    transmissionStatus.dataset.state = "waiting";
-    liveLabel.hidden = true;
+    const remoteSharer = Array.from(peerConnections.values()).find((peer) => peer.sharing);
+    if (remoteSharer) {
+      updateRemoteTransmissionState(true, remoteSharer.name);
+    } else if (remoteVideo.srcObject?.getVideoTracks().some((track) => track.readyState === "live")) {
+      markRemoteVideoActive();
+    } else {
+      transmissionStatus.textContent = "Nenhuma tela está sendo transmitida.";
+      transmissionStatus.dataset.state = "waiting";
+      liveLabel.hidden = true;
+    }
   }
-  if (changed && socket?.connected) socket.emit("sharing-state", { active });
 }
 
 function updateRemoteTransmissionState(active, remoteName) {
@@ -194,6 +231,11 @@ function updateRemoteTransmissionState(active, remoteName) {
     transmissionStatus.textContent = `${remoteName || "A outra pessoa"} iniciou o envio da tela. Aguardando a imagem aparecer.`;
     transmissionStatus.dataset.state = "waiting";
   } else {
+    const otherSharer = Array.from(peerConnections.values()).find((peer) => peer.sharing);
+    if (otherSharer) {
+      updateRemoteTransmissionState(true, otherSharer.name);
+      return;
+    }
     viewerVideoActive = false;
     transmissionStatus.textContent = remoteName
       ? `${remoteName} não está compartilhando a tela no momento.`
@@ -283,41 +325,44 @@ async function connectToRoom() {
         });
       }
     });
-    socket.on("participants", renderParticipants);
-    socket.on("sharing-state", ({ active, name }) => updateRemoteTransmissionState(active, name));
-    socket.on("peer-ready", ({ peerId, name } = {}) => {
-      peerIsReady = true;
-      remotePeerId = peerId || null;
-      remoteParticipantName = name || "";
-      shareButton.disabled = false;
-      showStatus(`Conectado com ${remoteParticipantName || "outra pessoa"}; mídia ponto a ponto ativa`);
-      placeholderTitle.textContent = `${remoteParticipantName || "Outra pessoa"} conectada`;
-      placeholderDescription.textContent = screenStream
-        ? "Sua tela está pronta para ser enviada. O envio será confirmado quando houver quadros WebRTC."
-        : "Você ou essa pessoa podem iniciar o compartilhamento.";
-      if (screenStream) updateTransmissionState(false);
-      createPeerConnection();
+    socket.on("participants", (participants) => {
+      renderParticipants(participants);
     });
-    socket.on("peer-left", () => {
-      peerIsReady = false;
-      remotePeerId = null;
-      remoteParticipantName = "";
-      shareButton.disabled = false;
-      updateTransmissionState(false);
-      closePeerConnection();
-      updateRemoteTransmissionState(false, remoteParticipantName);
-      placeholderTitle.textContent = "A conexão de mídia foi encerrada";
-      placeholderDescription.textContent = "Quando outra pessoa iniciar ou parar de compartilhar, a conexão será atualizada.";
-      showStatus("A outra pessoa saiu da sala");
+    socket.on("sharing-state", ({ active, name, peerId }) => {
+      const peer = peerConnections.get(peerId);
+      if (peer) {
+        peer.sharing = active;
+        if (name) peer.name = name;
+      } else if (active) createPeerConnection(peerId, name);
+      if (active && peer?.state.remoteStream) {
+        attachRemoteStream(peerId, peer.name, peer.state.remoteStream);
+      } else if (!active && peer) {
+        removeRemotePeerStream(peerId);
+      }
+      updateStatsConnection();
+      updateRemoteTransmissionState(active, name);
     });
-    socket.on("media-waiting", ({ message } = {}) => {
-      if (peerIsReady) return;
+    socket.on("peer-ready", ({ peerId, name, sharing } = {}) => {
+      if (!peerId || peerId === socket.id) return;
       shareButton.disabled = false;
-      showStatus(message || "Aguardando uma conexão de mídia disponível");
+      createPeerConnection(peerId, name);
+      const peer = peerConnections.get(peerId);
+      if (peer) peer.sharing = Boolean(sharing);
+      if (sharing) updateRemoteTransmissionState(true, name);
+      updateStatsConnection();
+      showStatus("Conectado à sala; pronto para receber telas compartilhadas");
+    });
+    socket.on("peer-left", ({ peerId } = {}) => {
+      if (peerId) closePeerConnection(peerId);
+      peerIsReady = peerConnections.size > 0;
+      shareButton.disabled = false;
+      if (!peerIsReady && !remoteVideo.srcObject) {
+        placeholderTitle.textContent = "Aguardando compartilhamento";
+        placeholderDescription.textContent = "Quando alguém compartilhar a tela, ela aparecerá aqui.";
+      }
     });
     socket.on("signal", (data) => {
-      if (data.peerId !== remotePeerId) return;
-      signalQueue = signalQueue.then(() => handleSignal(data)).catch((error) => {
+      signalQueue = signalQueue.then(() => handleSignal(data, data.peerId)).catch((error) => {
         console.error("Falha ao negociar a conexao:", error);
         showStatus("Falha ao conectar as telas. Atualize a pagina.", "error");
       });
@@ -371,35 +416,83 @@ function resetQualityDashboard() {
   statsSample = null;
 }
 
-function closePeerConnection() {
-  if (statsTimer) window.clearInterval(statsTimer);
-  statsTimer = null;
-  if (peerConnection) {
-    peerConnection.ontrack = null;
-    peerConnection.close();
-    peerConnection = null;
+function closePeerConnection(peerId) {
+  const states = peerId ? [[peerId, peerConnections.get(peerId)]] : Array.from(peerConnections);
+  for (const [id, state] of states) {
+    if (!state) continue;
+    state.connection.ontrack = null;
+    state.connection.close();
+    peerConnections.delete(id);
+    const tile = remoteStreamElements.get(id);
+    if (tile) tile.remove();
+    remoteStreamElements.delete(id);
+    if (remoteVideo.srcObject === state.remoteStream) {
+      remoteVideo.srcObject = null;
+      remoteParticipantName = "";
+      promoteRemoteStream();
+    }
   }
-  pendingCandidates = [];
-  makingOffer = false;
-  negotiationPending = false;
-  ignoreOffer = false;
-  settingRemoteAnswerPending = false;
-  viewerVideoActive = false;
-  remoteVideo.srcObject = null;
+  peerIsReady = peerConnections.size > 0;
+  updateStatsConnection();
+  if (!peerConnection) {
+    remoteVideo.srcObject = null;
+    videoPlaceholder.hidden = false;
+    liveLabel.hidden = true;
+    resetQualityDashboard();
+  }
   localPreview.srcObject = screenStream;
-  remoteVideo.muted = true;
-  audioToggle.disabled = true;
-  audioToggle.textContent = "Áudio indisponível";
-  audioToggle.setAttribute("aria-pressed", "false");
-  videoPlaceholder.hidden = false;
-  playVideoButton.hidden = true;
-  playbackBlocked = false;
-  liveLabel.hidden = true;
-  resetQualityDashboard();
-  if (screenStream) {
-    placeholderTitle.textContent = "Prévia local da sua tela";
-    placeholderDescription.textContent = "A confirmação de envio aparecerá quando os quadros forem transmitidos.";
-    playLocalPreview();
+  if (remoteVideo.srcObject) updateRemoteAudio(remoteVideo.srcObject);
+  else {
+    remoteVideo.muted = true;
+    audioToggle.disabled = true;
+    audioToggle.textContent = "Áudio indisponível";
+    audioToggle.setAttribute("aria-pressed", "false");
+  }
+  if (screenStream) playLocalPreview();
+}
+
+function removeRemotePeerStream(peerId) {
+  const peer = peerConnections.get(peerId);
+  const tile = remoteStreamElements.get(peerId);
+  if (tile) tile.remove();
+  remoteStreamElements.delete(peerId);
+  if (peer && remoteVideo.srcObject === peer.state.remoteStream) {
+    remoteVideo.srcObject = null;
+    remoteParticipantName = "";
+    if (promoteRemoteStream()) return;
+    videoPlaceholder.hidden = false;
+    liveLabel.hidden = true;
+    updateRemoteAudio(new MediaStream());
+    placeholderTitle.textContent = screenStream
+      ? "Sua tela está sendo transmitida"
+      : "Aguardando compartilhamento";
+    placeholderDescription.textContent = "A imagem aparecerá quando alguém na sala iniciar o envio.";
+  }
+}
+
+function updateStatsConnection() {
+  const peers = Array.from(peerConnections.values());
+  const preferred = peers.find((peer) => peer.sharing && peer.connection.connectionState === "connected");
+  const connected = peers.find((peer) => peer.connection.connectionState === "connected");
+  const selected = screenStream
+    ? connected || peers[0]
+    : preferred || connected || peers[0];
+  const nextConnection = selected?.connection || null;
+  const changed = peerConnection !== nextConnection;
+  if (changed) {
+    if (statsTimer) window.clearInterval(statsTimer);
+    statsTimer = null;
+    peerConnection = nextConnection;
+    statsSample = null;
+  }
+  if (!statsTimer && peerConnection && typeof peerConnection.getStats === "function") {
+    statsTimer = window.setInterval(() => updateConnectionStats(peerConnection), 2000);
+  }
+  if (changed && peerConnection && typeof peerConnection.getStats === "function") {
+    metricState.textContent = "Negociação WebRTC em andamento";
+  }
+  if (peerConnection && typeof peerConnection.getStats !== "function") {
+    statsTimer = null;
   }
 }
 
@@ -414,8 +507,8 @@ function playLocalPreview() {
 }
 
 function sendSignal(data) {
-  if (socket?.connected && remotePeerId) {
-    socket.emit("signal", { ...data, peerId: remotePeerId });
+  if (socket?.connected && data.peerId) {
+    socket.emit("signal", data);
   }
 }
 
@@ -439,69 +532,48 @@ function requestSharingSlot(active) {
   });
 }
 
-function createPeerConnection() {
-  closePeerConnection();
+function createPeerConnection(peerId, peerName = "") {
+  if (peerConnections.has(peerId)) return peerConnections.get(peerId).connection;
   const capabilities = window.TelaCompatibility.getCapabilities();
   if (!capabilities.peerConnection) {
     showStatus("Este navegador nao oferece suporte a WebRTC.", "error");
     return;
   }
 
+  let connection;
+  const state = {
+    pendingCandidates: [],
+    makingOffer: false,
+    negotiationPending: false,
+    ignoreOffer: false,
+    settingRemoteAnswerPending: false,
+    remoteStream: null,
+  };
   try {
-    peerConnection = new RTCPeerConnection({ iceServers });
+    connection = new RTCPeerConnection({ iceServers });
   } catch (error) {
     showStatus(error.message || "Nao foi possivel iniciar WebRTC.", "error");
     return;
   }
-  const connection = peerConnection;
+  peerConnections.set(peerId, { connection, state, name: peerName, sharing: false });
+  peerIsReady = true;
+  updateStatsConnection();
 
   connection.onicecandidate = (event) => {
-    if (event.candidate) sendSignal({ type: "ice-candidate", candidate: event.candidate });
+    if (event.candidate) {
+      sendSignal({ type: "ice-candidate", candidate: event.candidate, peerId });
+    }
   };
   connection.ontrack = (event) => {
     const stream = event.streams[0] || new MediaStream([event.track]);
-    remoteVideo.srcObject = stream;
-    updateRemoteAudio(stream);
-
-    if (event.track.kind === "video") {
-      const renderLiveVideo = () => {
-        if (remoteVideo.srcObject !== stream || playbackBlocked) return;
-        placeholderTitle.textContent = "Conectado: aguardando imagem";
-        placeholderDescription.textContent = "O vídeo aparecerá assim que os primeiros quadros chegarem.";
-      };
-      event.track.addEventListener("unmute", renderLiveVideo);
-      event.track.addEventListener("mute", () => {
-        if (remoteVideo.srcObject !== stream) return;
-        videoPlaceholder.hidden = false;
-        liveLabel.hidden = true;
-        placeholderTitle.textContent = "Sinal de video interrompido";
-        placeholderDescription.textContent = "Aguardando a recuperacao da conexao.";
-        viewerVideoActive = false;
-        transmissionStatus.textContent = "O vídeo recebido foi interrompido. Tentando recuperar a conexão.";
-        transmissionStatus.dataset.state = "waiting";
-      });
-      event.track.addEventListener("ended", () => {
-        if (remoteVideo.srcObject !== stream) return;
-        videoPlaceholder.hidden = false;
-        liveLabel.hidden = true;
-        playVideoButton.hidden = true;
-        placeholderTitle.textContent = "Compartilhamento encerrado";
-        placeholderDescription.textContent = "Qualquer participante pode iniciar uma transmissão; até duas telas podem ser compartilhadas por vez.";
-        viewerVideoActive = false;
-        transmissionStatus.textContent = "A outra pessoa encerrou o compartilhamento.";
-        transmissionStatus.dataset.state = "waiting";
-      }, { once: true });
-      playRemoteVideo(stream);
-    }
-
-    event.track.addEventListener("ended", () => updateRemoteAudio(stream));
-    event.track.addEventListener("mute", () => updateRemoteAudio(stream));
-    event.track.addEventListener("unmute", () => updateRemoteAudio(stream));
+    if (state.remoteStream === stream) return;
+    state.remoteStream = stream;
+    attachRemoteStream(peerId, peerConnections.get(peerId)?.name || peerName, stream);
   };
   connection.onconnectionstatechange = () => {
-    if (peerConnection !== connection) return;
+    updateStatsConnection();
     if (connection.connectionState === "connected") {
-      showStatus("Conexao ponto a ponto ativa", "connected");
+      showStatus(`Conexão de mídia ativa${peerName ? ` com ${peerName}` : ""}`, "connected");
     } else if (connection.connectionState === "failed") {
       showStatus("Conexao WebRTC falhou. Tentando recuperar…", "error");
       updateTransmissionState(false);
@@ -513,8 +585,8 @@ function createPeerConnection() {
     }
   };
   connection.onnegotiationneeded = () => {
-    negotiationPending = true;
-    negotiateConnection(connection);
+    state.negotiationPending = true;
+    negotiateConnection(connection, peerId, state);
   };
   connection.oniceconnectionstatechange = () => {
     if (connection.iceConnectionState === "failed") {
@@ -525,32 +597,121 @@ function createPeerConnection() {
       }
     }
   };
-  if (typeof connection.getStats === "function") {
-    statsTimer = window.setInterval(() => updateConnectionStats(connection), 2000);
+  if (screenStream) {
+    for (const track of screenStream.getTracks()) {
+      addOrReplaceTrack(track, connection).catch(reportSenderError);
+    }
+  }
+  return connection;
+}
+
+function attachRemoteStream(peerId, peerName, stream) {
+  let video;
+  const primaryHasVideo = remoteVideo.srcObject?.getVideoTracks()
+    .some((track) => track.readyState === "live");
+  if (!primaryHasVideo || remoteVideo.srcObject === stream) {
+    video = remoteVideo;
+    remoteVideo.srcObject = stream;
+    remoteParticipantName = peerName || "a outra pessoa";
+    updateRemoteAudio(stream);
   } else {
-    metricState.textContent = "Estatisticas nao suportadas";
+    let tile = remoteStreamElements.get(peerId);
+    if (!tile) {
+      tile = document.createElement("div");
+      tile.className = "remote-stream-tile";
+      const name = document.createElement("span");
+      name.className = "remote-stream-name";
+      name.textContent = peerName || "Participante";
+      video = document.createElement("video");
+      video.autoplay = true;
+      video.playsInline = true;
+      video.muted = true;
+      const soundButton = document.createElement("button");
+      soundButton.className = "remote-stream-audio";
+      soundButton.type = "button";
+      soundButton.textContent = "Ativar áudio";
+      soundButton.setAttribute("aria-pressed", "false");
+      soundButton.disabled = !stream.getAudioTracks().some((track) => track.readyState === "live");
+      soundButton.addEventListener("click", () => {
+        video.muted = !video.muted;
+        soundButton.textContent = video.muted ? "Ativar áudio" : "Silenciar áudio";
+        soundButton.setAttribute("aria-pressed", String(!video.muted));
+        video.play().catch((error) => {
+          if (error?.name !== "AbortError") {
+            console.error("Nao foi possivel reproduzir o audio recebido:", error);
+          }
+        });
+      });
+      tile.append(video, name, soundButton);
+      remoteStreams.append(tile);
+      remoteStreamElements.set(peerId, tile);
+      if (viewerVideoActive) updateRemoteViewStatus();
+    } else {
+      video = tile.querySelector("video");
+    }
+    video.srcObject = stream;
+    video.play().catch((error) => {
+      if (error?.name !== "AbortError") {
+        console.error("Nao foi possivel reproduzir uma tela recebida:", error);
+      }
+    });
   }
 
-  if (screenStream) {
-    for (const track of screenStream.getTracks()) addOrReplaceTrack(track).catch(reportSenderError);
+  if (video === remoteVideo) playRemoteVideo(stream);
+  for (const track of stream.getTracks()) {
+    track.addEventListener("ended", () => {
+      if (track.kind === "audio" && remoteVideo.srcObject === stream) updateRemoteAudio(stream);
+      if (track.kind === "audio") {
+        const soundButton = remoteStreamElements.get(peerId)?.querySelector(".remote-stream-audio");
+        if (soundButton && !stream.getAudioTracks().some((audioTrack) => audioTrack.readyState === "live")) {
+          soundButton.disabled = true;
+          soundButton.textContent = "Áudio indisponível";
+          soundButton.setAttribute("aria-pressed", "false");
+        }
+      }
+      if (stream.getVideoTracks().some((videoTrack) => videoTrack.readyState === "live")) return;
+      const tile = remoteStreamElements.get(peerId);
+      if (tile && tile.querySelector("video").srcObject === stream) {
+        tile.remove();
+        remoteStreamElements.delete(peerId);
+      }
+      if (remoteVideo.srcObject === stream) {
+        remoteVideo.srcObject = null;
+        if (promoteRemoteStream()) return;
+        videoPlaceholder.hidden = false;
+        liveLabel.hidden = true;
+        updateRemoteAudio(new MediaStream());
+        if (screenStream) {
+          placeholderTitle.textContent = "Sua tela está sendo transmitida";
+          placeholderDescription.textContent = "Aguardando outra tela compartilhada na sala.";
+        } else {
+          placeholderTitle.textContent = "Aguardando compartilhamento";
+          placeholderDescription.textContent = "Quando alguém compartilhar a tela, ela aparecerá aqui.";
+        }
+      }
+    }, { once: true });
   }
 }
 
-async function negotiateConnection(connection) {
-  if (!peerIsReady || peerConnection !== connection || !negotiationPending) return;
-  if (makingOffer || connection.signalingState !== "stable") return;
-  makingOffer = true;
-  negotiationPending = false;
+async function negotiateConnection(connection, peerId, state) {
+  if (!peerConnections.has(peerId) || !state.negotiationPending) return;
+  if (state.makingOffer || connection.signalingState !== "stable") return;
+  state.makingOffer = true;
+  state.negotiationPending = false;
   try {
     await connection.setLocalDescription(await connection.createOffer());
-    sendSignal({ type: connection.localDescription.type, description: connection.localDescription });
+    sendSignal({
+      type: connection.localDescription.type,
+      description: connection.localDescription,
+      peerId,
+    });
   } catch (error) {
-    negotiationPending = false;
+    state.negotiationPending = false;
     showError(shareMessage, error);
   } finally {
-    makingOffer = false;
-    if (negotiationPending && connection.signalingState === "stable") {
-      negotiateConnection(connection);
+    state.makingOffer = false;
+    if (state.negotiationPending && connection.signalingState === "stable") {
+      negotiateConnection(connection, peerId, state);
     }
   }
 }
@@ -582,9 +743,8 @@ remoteVideo.addEventListener("playing", () => {
 remoteVideo.addEventListener("loadeddata", markRemoteVideoActive);
 remoteVideo.addEventListener("timeupdate", markRemoteVideoActive);
 
-async function addOrReplaceTrack(track) {
-  if (!peerConnection || peerConnection.connectionState === "closed") return;
-  const connection = peerConnection;
+async function addOrReplaceTrack(track, connection = peerConnection) {
+  if (!connection || connection.connectionState === "closed") return;
   let sender = connection.getSenders().find((item) => item.track?.kind === track.kind);
   if (!sender) {
     const transceiver = connection.getTransceivers().find((item) => (
@@ -604,56 +764,59 @@ async function addOrReplaceTrack(track) {
   if (track.kind === "video") {
     const transceiver = connection.getTransceivers().find((item) => item.sender === sender);
     if (transceiver) window.TelaCompatibility.prioritizeVideoCodecs(transceiver);
-    applySelectedProfile();
+    applySelectedProfile(connection);
   }
 }
 
-async function handleSignal(data) {
-  if (!peerConnection) {
+async function handleSignal(data, peerId) {
+  if (!peerConnections.has(peerId)) {
     if (!iceServers.length) throw new Error("Configuracao ICE ainda nao carregada.");
-    createPeerConnection();
+    createPeerConnection(peerId);
   }
-  const connection = peerConnection;
-  if (!connection) return;
+  const peer = peerConnections.get(peerId);
+  if (!peer) return;
+  const { connection, state } = peer;
 
   if (data.type === "offer" || data.type === "answer") {
     const description = data.description;
     if (!description || !["offer", "answer"].includes(description.type)) return;
-    const polite = socket.id > remotePeerId;
+    const polite = socket.id > peerId;
     const offerCollision = description.type === "offer"
-      && (makingOffer || (connection.signalingState !== "stable" && !settingRemoteAnswerPending));
-    ignoreOffer = !polite && offerCollision;
-    if (ignoreOffer) return;
+      && (state.makingOffer || (connection.signalingState !== "stable" && !state.settingRemoteAnswerPending));
+    state.ignoreOffer = !polite && offerCollision;
+    if (state.ignoreOffer) return;
     if (offerCollision) {
-      negotiationPending = true;
+      state.negotiationPending = true;
       await connection.setLocalDescription({ type: "rollback" });
     }
-    settingRemoteAnswerPending = description.type === "answer";
+    state.settingRemoteAnswerPending = description.type === "answer";
     try {
       await connection.setRemoteDescription(description);
     } finally {
-      settingRemoteAnswerPending = false;
+      state.settingRemoteAnswerPending = false;
     }
-    for (const candidate of pendingCandidates.splice(0)) {
+    for (const candidate of state.pendingCandidates.splice(0)) {
       await connection.addIceCandidate(candidate);
     }
     if (description.type === "offer") {
       await connection.setLocalDescription(await connection.createAnswer());
-      sendSignal({ type: connection.localDescription.type, description: connection.localDescription });
+      sendSignal({ type: connection.localDescription.type, description: connection.localDescription, peerId });
     }
-    if (negotiationPending && connection.signalingState === "stable") negotiateConnection(connection);
+    if (state.negotiationPending && connection.signalingState === "stable") {
+      negotiateConnection(connection, peerId, state);
+    }
     return;
   }
 
   if (data.type === "ice-candidate" && data.candidate) {
     if (!connection.remoteDescription) {
-      if (pendingCandidates.length < 64) pendingCandidates.push(data.candidate);
+      if (state.pendingCandidates.length < 64) state.pendingCandidates.push(data.candidate);
       return;
     }
     try {
       await connection.addIceCandidate(data.candidate);
     } catch (error) {
-      if (!ignoreOffer && connection.signalingState !== "closed") throw error;
+      if (!state.ignoreOffer && connection.signalingState !== "closed") throw error;
     }
   }
 }
@@ -662,15 +825,20 @@ function profileFromControls() {
   return window.TelaQuality.makeProfile(qualityResolution.value, qualityFps.value);
 }
 
-function applySelectedProfile(bitrateOverride) {
+function applySelectedProfile(connection, bitrateOverride) {
   const track = screenStream?.getVideoTracks()[0];
-  if (!track || !peerConnection) return;
-  const sender = peerConnection.getSenders().find((item) => item.track?.kind === "video");
-  if (!sender) return;
+  if (!track) return;
+  const connections = connection
+    ? [connection]
+    : Array.from(peerConnections.values(), (peer) => peer.connection);
   const profile = selectedProfile;
-  qualityApplyQueue = qualityApplyQueue
-    .then(() => window.TelaQuality.applySenderProfile(sender, track, profile, bitrateOverride))
-    .catch(reportSenderError);
+  for (const peerConnection of connections) {
+    const sender = peerConnection.getSenders().find((item) => item.track?.kind === "video");
+    if (!sender) continue;
+    qualityApplyQueue = qualityApplyQueue
+      .then(() => window.TelaQuality.applySenderProfile(sender, track, profile, bitrateOverride))
+      .catch(reportSenderError);
+  }
 }
 
 function reportSenderError(error) {
@@ -686,12 +854,15 @@ function setAdaptiveQuality(metrics) {
   );
   if (adjustment.changed) {
     const track = screenStream?.getVideoTracks()[0];
-    const sender = peerConnection?.getSenders().find((item) => item.track?.kind === "video");
-    if (track && sender) {
+    if (track) {
       const profile = adjustment.profile;
-      qualityApplyQueue = qualityApplyQueue
-        .then(() => window.TelaQuality.applySenderProfile(sender, track, profile, adjustment.bitrate))
-        .catch(reportSenderError);
+      for (const peer of peerConnections.values()) {
+        const sender = peer.connection.getSenders().find((item) => item.track?.kind === "video");
+        if (!sender) continue;
+        qualityApplyQueue = qualityApplyQueue
+          .then(() => window.TelaQuality.applySenderProfile(sender, track, profile, adjustment.bitrate))
+          .catch(reportSenderError);
+      }
     }
     qualityWarning.textContent = adjustment.restoring
       ? adjustment.degraded
@@ -851,8 +1022,11 @@ async function toggleScreenSharing() {
       shareMessage.textContent = "Esta tela ou navegador nao forneceu audio; o compartilhamento de video continua normalmente.";
     }
     for (const track of screenStream.getTracks()) {
-      if (peerConnection) await addOrReplaceTrack(track);
+      for (const peer of peerConnections.values()) {
+        await addOrReplaceTrack(track, peer.connection);
+      }
     }
+    updateStatsConnection();
     applySelectedProfile();
     shareButton.innerHTML = "Parar compartilhamento <span aria-hidden=\"true\">■</span>";
     if (!audioCapture.checked || audioTracks.length) {
@@ -885,12 +1059,16 @@ function stopScreenSharing() {
     socket.emit("request-sharing", { active: false });
   }
   const tracks = stream.getTracks();
-  const senders = peerConnection?.getSenders() || [];
-  const replacements = tracks.map((track) => {
-    const sender = senders.find((item) => item.track === track);
-    return sender ? sender.replaceTrack(null) : Promise.resolve();
-  });
+  const replacements = [];
+  for (const peer of peerConnections.values()) {
+    const senders = peer.connection.getSenders();
+    for (const track of tracks) {
+      const sender = senders.find((item) => item.track === track);
+      if (sender) replacements.push(sender.replaceTrack(null));
+    }
+  }
   Promise.all(replacements).catch(reportSenderError);
+  updateStatsConnection();
   for (const track of tracks) {
     if (track.readyState !== "ended") track.stop();
   }
@@ -994,7 +1172,7 @@ window.addEventListener("beforeunload", () => {
   if (screenStream) {
     for (const track of screenStream.getTracks()) track.stop();
   }
-  if (peerConnection) peerConnection.close();
+  closePeerConnection();
 });
 
 const initialParams = new URLSearchParams(window.location.search);
