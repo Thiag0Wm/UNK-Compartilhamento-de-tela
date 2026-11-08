@@ -86,6 +86,7 @@
             <div class="video-frame">
               <video id="remote-video" autoplay playsinline></video>
               <video id="local-preview" autoplay muted playsinline hidden></video>
+              <div id="remote-streams" class="remote-streams" aria-live="polite"></div>
               <div id="video-placeholder" class="video-placeholder">
                 <div class="placeholder-icon" aria-hidden="true"><span></span></div>
                 <strong id="placeholder-title">Aguardando a outra pessoa</strong>
@@ -147,7 +148,7 @@
             <section id="host-controls" class="side-card action-card">
               <div class="side-card-icon screen-icon" aria-hidden="true">▣</div>
               <h2>Compartilhe sua tela</h2>
-              <p>Até duas pessoas podem compartilhar ao mesmo tempo. Qualquer participante pode iniciar; a tela conecta você ao outro transmissor.</p>
+              <p>Até duas pessoas podem compartilhar ao mesmo tempo. Qualquer participante pode iniciar; as telas ficam visíveis para todos na sala.</p>
               <button id="share-screen" class="button button-primary button-full" type="button">Compartilhar tela <span aria-hidden="true">↗</span></button>
               <p id="share-message" class="inline-message" role="status" aria-live="polite"></p>
               <label class="audio-choice">
