@@ -33,6 +33,24 @@ function waitForSocketEvent(socket, eventName) {
   });
 }
 
+function collectSocketEvents(socket, eventName, count) {
+  return new Promise((resolve, reject) => {
+    const events = [];
+    const timeout = setTimeout(() => {
+      socket.off(eventName, onEvent);
+      reject(new Error(`Timed out waiting for ${count} Socket.IO ${eventName} events`));
+    }, 3000);
+    const onEvent = (...args) => {
+      events.push(args);
+      if (events.length < count) return;
+      clearTimeout(timeout);
+      socket.off(eventName, onEvent);
+      resolve(events);
+    };
+    socket.on(eventName, onEvent);
+  });
+}
+
 function requestSharing(socket, active) {
   return new Promise((resolve) => {
     socket.emit("request-sharing", { active }, resolve);
@@ -149,15 +167,16 @@ test("creates rooms, serves the web app, and relays WebRTC signaling", async () 
       transports: ["websocket"],
     });
     socketIoClients.push(viewerClient);
+    const socketHostReady = waitForSocketEvent(hostClient, "peer-ready");
+    const socketViewerReady = waitForSocketEvent(viewerClient, "peer-ready");
     const viewerConnected = waitForSocketEvent(viewerClient, "connect");
     const viewerJoined = waitForSocketEvent(viewerClient, "joined");
     const hostParticipants = waitForSocketEvent(hostClient, "participants");
     const viewerParticipants = waitForSocketEvent(viewerClient, "participants");
     await Promise.all([viewerConnected, viewerJoined]);
-    const socketHostReady = waitForSocketEvent(hostClient, "peer-ready");
-    const socketViewerReady = waitForSocketEvent(viewerClient, "peer-ready");
-    assert.deepEqual(await requestSharing(hostClient, true), { ok: true });
-    await Promise.all([socketHostReady, socketViewerReady]);
+    const [hostPeerReady, viewerPeerReady] = await Promise.all([socketHostReady, socketViewerReady]);
+    assert.equal(hostPeerReady[0].peerId, viewerClient.id);
+    assert.equal(viewerPeerReady[0].peerId, hostClient.id);
     const expectedParticipants = [
       { id: hostClient.id, name: "Ana", role: "host", sharing: false },
       { id: viewerClient.id, name: "Bia", role: "viewer", sharing: false },
@@ -168,7 +187,7 @@ test("creates rooms, serves the web app, and relays WebRTC signaling", async () 
 
     const viewerSharingState = waitForSocketEvent(viewerClient, "sharing-state");
     hostClient.emit("sharing-state", { active: true });
-    assert.deepEqual((await viewerSharingState)[0], { active: true, name: "Ana" });
+    assert.deepEqual((await viewerSharingState)[0], { active: true, name: "Ana", peerId: hostClient.id });
 
     const socketSignal = waitForSocketEvent(viewerClient, "signal");
     hostClient.emit("signal", {
@@ -195,7 +214,7 @@ test("creates rooms, serves the web app, and relays WebRTC signaling", async () 
 
     const hostSharingState = waitForSocketEvent(hostClient, "sharing-state");
     viewerClient.emit("sharing-state", { active: true });
-    assert.deepEqual((await hostSharingState)[0], { active: true, name: "Bia" });
+    assert.deepEqual((await hostSharingState)[0], { active: true, name: "Bia", peerId: viewerClient.id });
   } finally {
     for (const client of socketIoClients) client.disconnect();
     for (const socket of sockets) socket.terminate();
@@ -237,30 +256,109 @@ test("lets any two room participants share and rejects a third simultaneous shar
       viewers.push(viewer);
     }
 
-    const firstPairReady = waitForSocketEvent(viewers[1], "peer-ready");
     assert.deepEqual(await requestSharing(viewers[1], true), { ok: true });
-    assert.equal((await firstPairReady)[0].peerId, host.id);
 
-    const arbitraryPairA = waitForSocketEvent(viewers[1], "peer-ready");
-    const arbitraryPairB = waitForSocketEvent(viewers[2], "peer-ready");
     assert.deepEqual(await requestSharing(viewers[2], true), { ok: true });
-    assert.equal((await arbitraryPairA)[0].peerId, viewers[2].id);
-    assert.equal((await arbitraryPairB)[0].peerId, viewers[1].id);
 
     assert.deepEqual(await requestSharing(viewers[3], true), {
       ok: false,
       message: "Duas pessoas já estão compartilhando. Aguarde uma vaga.",
     });
 
-    const pairEnded = waitForSocketEvent(viewers[1], "peer-left");
+    const shareStopped = waitForSocketEvent(viewers[1], "sharing-state");
     assert.deepEqual(await requestSharing(viewers[2], false), { ok: true });
-    await pairEnded;
+    assert.deepEqual((await shareStopped)[0], {
+      active: false,
+      name: "Visitante 3",
+      peerId: viewers[2].id,
+    });
 
-    const reassignedA = waitForSocketEvent(viewers[1], "peer-ready");
-    const reassignedB = waitForSocketEvent(viewers[3], "peer-ready");
     assert.deepEqual(await requestSharing(viewers[3], true), { ok: true });
-    assert.equal((await reassignedA)[0].peerId, viewers[3].id);
-    assert.equal((await reassignedB)[0].peerId, viewers[1].id);
+  } finally {
+    for (const client of clients) client.disconnect();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("connects late participants to every peer and routes signaling directly", async () => {
+  const server = createApplicationServer();
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const clients = [];
+
+  function join(room, name, role = "viewer") {
+    const client = createSocketClient(baseUrl, {
+      auth: {
+        roomId: room.roomId,
+        role,
+        token: role === "host" ? room.hostToken : undefined,
+        name,
+      },
+      reconnection: false,
+      transports: ["websocket"],
+    });
+    clients.push(client);
+    return client;
+  }
+
+  async function connect(client) {
+    await waitForSocketEvent(client, "connect");
+  }
+
+  async function relaySignal(sender, recipient) {
+    const received = waitForSocketEvent(recipient, "signal");
+    sender.emit("signal", {
+      type: "offer",
+      description: { type: "offer", sdp: `sdp-${sender.id}-${recipient.id}` },
+      peerId: recipient.id,
+    });
+    return (await received)[0];
+  }
+
+  try {
+    const response = await fetch(`${baseUrl}/api/rooms`, { method: "POST" });
+    const room = await response.json();
+    const host = join(room, "Anfitriao", "host");
+    await connect(host);
+
+    const sharer = join(room, "Compartilhando");
+    const hostReady = waitForSocketEvent(host, "peer-ready");
+    const sharerReady = waitForSocketEvent(sharer, "peer-ready");
+    await connect(sharer);
+    assert.equal((await hostReady)[0].peerId, sharer.id);
+    assert.equal((await sharerReady)[0].peerId, host.id);
+    assert.deepEqual(await requestSharing(sharer, true), { ok: true });
+
+    const third = join(room, "Terceira pessoa");
+    const thirdReady = collectSocketEvents(third, "peer-ready", 2);
+    const hostReadyThird = waitForSocketEvent(host, "peer-ready");
+    const sharerReadyThird = waitForSocketEvent(sharer, "peer-ready");
+    await connect(third);
+    const thirdPeers = (await thirdReady).map(([event]) => event);
+    assert.deepEqual(new Set(thirdPeers.map((event) => event.peerId)), new Set([host.id, sharer.id]));
+    assert.equal(thirdPeers.find((event) => event.peerId === sharer.id).sharing, true);
+    assert.equal((await hostReadyThird)[0].peerId, third.id);
+    assert.equal((await sharerReadyThird)[0].peerId, third.id);
+
+    for (const [sender, recipient] of [[sharer, host], [sharer, third], [third, host], [third, sharer]]) {
+      const event = await relaySignal(sender, recipient);
+      assert.equal(event.peerId, sender.id);
+      assert.equal(event.description.sdp, `sdp-${sender.id}-${recipient.id}`);
+    }
+
+    const fourth = join(room, "Quarta pessoa");
+    const fourthReady = collectSocketEvents(fourth, "peer-ready", 3);
+    const existingReady = [host, sharer, third].map((client) => waitForSocketEvent(client, "peer-ready"));
+    await connect(fourth);
+    assert.deepEqual(
+      new Set((await fourthReady).map(([event]) => event.peerId)),
+      new Set([host.id, sharer.id, third.id]),
+    );
+    assert.deepEqual(
+      new Set((await Promise.all(existingReady)).map(([event]) => event.peerId)),
+      new Set([fourth.id]),
+    );
   } finally {
     for (const client of clients) client.disconnect();
     await new Promise((resolve) => server.close(resolve));
