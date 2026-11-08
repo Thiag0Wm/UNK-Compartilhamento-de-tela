@@ -1,6 +1,4 @@
 # UNK
-**Utilize o UNK:** [unk-compartilhamento-de-tela.pages.dev](https://unk-compartilhamento-de-tela.pages.dev)
-
 
 Aplicacao web UNK para compartilhar uma tela com outra pessoa, sem cadastro, extensao ou instalacao. A captura usa `getDisplayMedia()`, a midia trafega por WebRTC e o servidor cria salas temporarias e encaminha a sinalizacao por Socket.IO. A rota WebSocket original continua disponivel para compatibilidade.
 
@@ -17,7 +15,7 @@ npm install
 npm start
 ```
 
-Abra `http://localhost:3000` no Chrome, Edge, Brave ou Firefox. Em `localhost`, os navegadores permitem captura de tela sem HTTPS. Clique em **Criar uma sala**, informe seu nome e copie o link de convite para abrir em outros navegadores ou computadores. Cada sala aceita ate cinco pessoas, incluindo o anfitriao; a proxima tentativa recebe a mensagem **Sala esta cheia**. Na arquitetura WebRTC atual, a midia ponto a ponto e negociada entre o anfitriao e o primeiro visitante conectado; os demais podem entrar e aparecem na lista, mas nao recebem a tela enquanto essa limitacao existir. Na sala, **Sinalizacao conectada** significa que a sala esta acessivel, nao que a tela ja esta sendo enviada: o estado **Envio confirmado** aparece quando novas imagens sao codificadas pelo WebRTC, e **AO VIVO** quando os quadros recebidos podem ser exibidos.
+Abra `http://localhost:3000` no Chrome, Edge, Brave ou Firefox. Em `localhost`, os navegadores permitem captura de tela sem HTTPS. Clique em **Criar uma sala**, informe seu nome e copie o link de convite para abrir em outros navegadores ou computadores. Cada sala aceita ate cinco pessoas, incluindo o anfitriao; a proxima tentativa recebe a mensagem **Sala esta cheia**. Qualquer participante pode iniciar a captura; ate duas pessoas podem reservar transmissao ao mesmo tempo, sem depender de quem entrou primeiro ou de ser anfitriao. Quando a segunda pessoa inicia, o WebRTC conecta dinamicamente os dois transmissores, que podem ver as telas um do outro. Com uma unica transmissao, ela e conectada a outra pessoa disponivel na sala. Os demais participantes podem entrar, mas nao recebem video enquanto estiverem fora do par de midia ativo. Na sala, **Sinalizacao conectada** significa que a sala esta acessivel, nao que a tela ja esta sendo enviada: o estado **Envio confirmado** aparece quando novas imagens sao codificadas pelo WebRTC, e **AO VIVO** quando os quadros recebidos podem ser exibidos.
 
 No PowerShell do Windows, use `npm.cmd` para evitar o bloqueio de scripts `.ps1` da politica de execucao:
 
@@ -110,7 +108,7 @@ Sem um servidor TURN configurado, algumas combinacoes de roteadores, firewalls e
 - Chrome, Microsoft Edge, Brave e Firefox atuais; Windows, macOS e Linux, sujeitos as permissoes e capacidades de captura de cada navegador e sistema.
 - O link de convite permite entrar como visitante; o link privado de anfitriao continua protegido e nao e copiado pelo botao de convite. As duas pessoas no par de midia ativo podem iniciar e encerrar o proprio compartilhamento. Se ambas compartilharem, a tela recebida aparece em destaque e a previa local no canto.
 - Ao abrir um link de sala, cada participante informa um nome (ate 32 caracteres); a lista mostra os participantes conectados no momento.
-- Cada sala admite no maximo cinco conexoes (anfitriao + quatro visitantes), controladas no servidor. A capacidade da sala nao altera a arquitetura WebRTC ponto a ponto: atualmente, somente o anfitriao e o primeiro visitante conectado negociam midia.
+- Cada sala admite no maximo cinco conexoes (anfitriao + quatro visitantes), controladas no servidor. No maximo dois participantes podem reservar transmissao simultanea. O par WebRTC e formado dinamicamente pelos transmissores ativos; se apenas uma pessoa estiver transmitindo, ela e conectada a outro participante disponivel.
 - A tela recebida aparece em destaque e a pre-visualizacao local no canto. A indicacao de envio muda para confirmada depois que novas imagens aparecem nas estatisticas WebRTC; o indicador ao vivo aparece quando o video recebido realmente comeca a tocar.
 - A pessoa que transmite confirma quadros codificados (saida WebRTC); a outra pessoa confirma quadros decodificados (entrada) e um quadro de video pronto para exibicao. A falta de novos quadros em um unico intervalo de estatisticas nao encerra o estado ao vivo.
 - A conexao de midia e ponto a ponto com WebRTC; TURN pode retransmitir midia quando necessario.
@@ -134,8 +132,8 @@ Os testes automatizados nao simulam os seletores de compartilhamento nem substit
 
 1. Abra a URL HTTPS do Pages em dois dispositivos/navegadores suportados e em redes diferentes, se possivel.
 2. No primeiro navegador, crie uma sala, informe o nome e envie o link de convite ao segundo. Ambos devem aparecer na lista de participantes. A sala aceita ate cinco pessoas; teste tambem a rejeicao de uma sexta pessoa e a liberacao de uma vaga quando alguem sai.
-3. Clique em **Compartilhar tela** em um dos dispositivos e autorize a captura no seletor nativo do navegador. Confirme a imagem remota, o estado ao vivo e as estatisticas WebRTC; nao use apenas o indicador de conexao Socket.IO como evidencia. A verificacao de midia se aplica ao anfitriao e ao primeiro visitante conectado.
-4. Pare a captura e confirme que o estado volta a indicar espera. Repita no sentido oposto; ambos os participantes podem transmitir.
+3. Clique em **Compartilhar tela** em um dos dispositivos e autorize a captura no seletor nativo do navegador. Confirme a imagem remota, o estado ao vivo e as estatisticas WebRTC; nao use apenas o indicador de conexao Socket.IO como evidencia.
+4. Em uma sala com ate cinco pessoas, teste uma transmissao iniciada por visitantes que nao sejam o primeiro a entrar; confirme que qualquer par de duas pessoas consegue transmitir e ver a tela da outra. Tente uma terceira transmissao simultanea e confirme a mensagem de limite; pare uma tela e tente novamente para verificar a liberacao da vaga.
 5. Se o teste entre redes falhar, repita em redes sem VPN/firewall ou configure um servico TURN externo. Teste audio somente quando o navegador e o sistema operacional oferecerem a faixa.
 
 Os testes automatizados nao comprovam que uma transmissao de producao funciona em dispositivos, navegadores ou redes reais. Este repositorio nao foi implantado nem testado em uma conta Render/Cloudflare por esses testes locais.

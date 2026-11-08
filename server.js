@@ -134,13 +134,6 @@ function validSignal(data) {
   return isDescription || isCandidate;
 }
 
-function getMediaPair(room) {
-  const peers = Array.from(room.socketPeers.values()).filter((peer) => peer.connected);
-  const host = peers.find((peer) => peer.data.role === "host");
-  const viewer = peers.find((peer) => peer.data.role === "viewer");
-  return host && viewer ? [host, viewer] : null;
-}
-
 function connectSocketIo(server, allowedOrigins) {
   const io = new SocketIOServer(server, {
     serveClient: true,
@@ -188,16 +181,34 @@ function connectSocketIo(server, allowedOrigins) {
   function broadcastParticipants(room) {
     const participants = Array.from(room.socketPeers.values())
       .filter((peer) => peer.connected)
-      .map((peer) => ({ name: peer.data.name, role: peer.data.role }));
+      .map((peer) => ({
+        id: peer.id,
+        name: peer.data.name,
+        role: peer.data.role,
+        sharing: room.shareRequests.has(peer.id),
+      }));
     for (const peer of room.socketPeers.values()) {
       if (peer.connected) peer.emit("participants", participants);
     }
   }
 
+  function getMediaPair(room) {
+    const activeSharers = Array.from(room.shareRequests)
+      .map((id) => room.socketPeers.get(id))
+      .filter((peer) => peer?.connected);
+    if (activeSharers.length >= 2) return activeSharers.slice(0, 2);
+    if (activeSharers.length === 1) {
+      const receiver = Array.from(room.socketPeers.values())
+        .find((peer) => peer.connected && peer.id !== activeSharers[0].id);
+      return receiver ? [activeSharers[0], receiver] : [];
+    }
+    return [];
+  }
+
   function updateMediaPair(room) {
     const previousPair = room.mediaPair || [];
     const nextPair = getMediaPair(room);
-    const nextIds = nextPair?.map((peer) => peer.id) || [];
+    const nextIds = nextPair.map((peer) => peer.id);
     const pairUnchanged = previousPair.length === nextIds.length
       && previousPair.every((id, index) => id === nextIds[index]);
 
@@ -208,7 +219,7 @@ function connectSocketIo(server, allowedOrigins) {
       }
 
       room.mediaPair = nextIds;
-      if (nextPair) {
+      if (nextPair.length === 2) {
         nextPair[0].emit("peer-ready", {
           peerId: nextPair[1].id,
           name: nextPair[1].data.name,
@@ -217,19 +228,20 @@ function connectSocketIo(server, allowedOrigins) {
           peerId: nextPair[0].id,
           name: nextPair[0].data.name,
         });
-        for (const [peer, otherPeer] of [[nextPair[0], nextPair[1]], [nextPair[1], nextPair[0]]]) {
-          if (otherPeer.data.sharing) {
-            peer.emit("sharing-state", { active: true, name: otherPeer.data.name });
-          }
-        }
       }
     }
 
     const pairedIds = new Set(room.mediaPair || []);
     for (const peer of room.socketPeers.values()) {
-      if (peer.connected && !pairedIds.has(peer.id)) {
+      if (!peer.connected || pairedIds.has(peer.id)) continue;
+      if (room.mediaPair.length === 2) {
+        const message = room.shareRequests.size >= 2
+          ? "Duas pessoas já estão compartilhando. Você pode iniciar quando uma delas parar."
+          : "Uma pessoa está compartilhando. Você também pode iniciar para formar o par de transmissão.";
+        peer.emit("media-waiting", { message });
+      } else if (room.shareRequests.has(peer.id)) {
         peer.emit("media-waiting", {
-          message: "A mídia ao vivo é ponto a ponto entre o anfitrião e um visitante por vez.",
+          message: "Sua tela está reservada. Aguarde outra pessoa entrar para conectar a mídia.",
         });
       }
     }
@@ -262,8 +274,30 @@ function connectSocketIo(server, allowedOrigins) {
       }
       if (!room.mediaPair?.includes(socket.id)) return;
       const peerId = room.mediaPair.find((id) => id !== socket.id);
+      if (data.peerId && data.peerId !== peerId) return;
       const peer = room.socketPeers.get(peerId);
-      if (peer?.connected) peer.emit("signal", data);
+      if (peer?.connected) {
+        const { peerId: _targetPeerId, ...signalData } = data;
+        peer.emit("signal", { ...signalData, peerId: socket.id });
+      }
+    });
+
+    socket.on("request-sharing", (data, acknowledge = () => {}) => {
+      if (typeof data?.active !== "boolean") {
+        acknowledge({ ok: false, message: "Solicitação de compartilhamento inválida." });
+        return;
+      }
+
+      if (data.active && !room.shareRequests.has(socket.id) && room.shareRequests.size >= 2) {
+        acknowledge({ ok: false, message: "Duas pessoas já estão compartilhando. Aguarde uma vaga." });
+        return;
+      }
+
+      if (data.active) room.shareRequests.add(socket.id);
+      else room.shareRequests.delete(socket.id);
+      broadcastParticipants(room);
+      updateMediaPair(room);
+      acknowledge({ ok: true });
     });
 
     socket.on("sharing-state", (data) => {
@@ -280,6 +314,7 @@ function connectSocketIo(server, allowedOrigins) {
     socket.on("disconnect", () => {
       if (room.socketPeers.get(socket.id) !== socket) return;
       room.socketPeers.delete(socket.id);
+      room.shareRequests.delete(socket.id);
       broadcastParticipants(room);
       updateMediaPair(room);
       if (!room.peers.size && !room.socketPeers.size) {
@@ -379,6 +414,8 @@ function createApplicationServer(options = {}) {
         hostToken,
         peers: new Map(),
         socketPeers: new Map(),
+        shareRequests: new Set(),
+        mediaPair: [],
       });
       sendJson(response, 201, { roomId: id, hostToken });
       return;
